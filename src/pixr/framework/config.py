@@ -23,6 +23,9 @@ class OptimizationCfg:
     layer_decay: Optional[float] = None
     encoder_lr_scale: float = 1.0  # LR multiplier for the (pretrained) image encoder
     label_smoothing: float = 0.
+    # scale loss by batch size relative to the mean for variable batch size (NaFlex schedule) loaders,
+    # 'none', 'linear' (sum-like, per-sample gradient weight constant) or 'sqrt'
+    loss_batch_scale: str = 'none'
 
 
 @dataclass

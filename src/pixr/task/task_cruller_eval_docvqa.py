@@ -25,6 +25,7 @@ def docvqa_task_cfg(
         image_fmt: str,
         text_process_fn=None,
         is_training: bool = True,
+        image_process_factory=None,
 ):
     """ chugr DocVQA pipeline cfg. Samples: '<s_question>{q}</s_question><s_answer>[{a}</s_answer>]'.
 
@@ -32,6 +33,7 @@ def docvqa_task_cfg(
     """
     return chugr.DataTaskDocVqaCfg(
         image_process_fn=image_process_fn,
+        image_process_factory=image_process_factory,
         text_process_fn=text_process_fn,
         image_input_feat=image_feature_info(image_fmt),
         text_target_feat=chugr.FeatureInfo('text_target', input_key=None) if is_training else None,

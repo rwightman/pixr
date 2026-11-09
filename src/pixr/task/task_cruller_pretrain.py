@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 import chugr
 
-from pixr.data import create_image_preprocessor
+from pixr.data import create_image_preprocessor, ImagePreprocessorFactory
 from pixr.framework import TaskTrainCfg, TaskTrain, DeviceEnv, Monitor
 from pixr.generation import generate_greedy
 from pixr.utils import text_error_rates
@@ -74,6 +74,7 @@ class TaskCrullerPretrain(TaskTrain):
     def train_data_cfg(self):
         return chugr.DataTaskDocReadCfg(
             image_process_fn=self.image_preprocess_train,
+            image_process_factory=ImagePreprocessorFactory(self.input_info, True, self.cfg.image_transforms),
             text_process_fn=self.text_preprocess_train,
             image_input_feat=image_feature_info(self.input_info['image_fmt']),
             page_sampling=self.cfg.page_sampling,

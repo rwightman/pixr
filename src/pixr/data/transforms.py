@@ -8,6 +8,7 @@ def create_image_preprocessor(
         input_info: Dict[str, Any],
         is_training: bool,
         transform_type: Optional[str] = None,
+        max_seq_len: Optional[int] = None,
 ):
     """ Create image preprocessing for a model's image input requirements (see ImageEncoderTimm.input_info).
 
@@ -33,6 +34,19 @@ def create_image_preprocessor(
         fill_color=255,
         transform_type=transform_type,
         patch_size=input_info['patch_size'],
-        max_seq_len=input_info['max_seq_len'],
+        max_seq_len=max_seq_len or input_info['max_seq_len'],
     )
     return chugr.create_image_preprocessor(cfg, is_training=is_training)
+
+
+class ImagePreprocessorFactory:
+    """ seq_len -> image preprocessor, for NaFlex bucketed batching (picklable for dataloader workers). """
+
+    def __init__(self, input_info: Dict[str, Any], is_training: bool, transform_type: Optional[str] = None):
+        self.input_info = dict(input_info)
+        self.is_training = is_training
+        self.transform_type = transform_type
+
+    def __call__(self, seq_len: int):
+        return create_image_preprocessor(
+            self.input_info, self.is_training, transform_type=self.transform_type, max_seq_len=seq_len)

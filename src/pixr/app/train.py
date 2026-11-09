@@ -180,6 +180,7 @@ def main(argv=None):
     task.setup(
         num_batches_per_interval=loaders['train'].num_batches,
         resume=resume,
+        mean_batch_size=loaders['train'].mean_batch_size,
     )
     if resume:
         loaders['train'].set_interval(task.interval_idx)

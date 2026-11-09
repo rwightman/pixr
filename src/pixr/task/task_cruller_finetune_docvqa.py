@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 import chugr
 
-from pixr.data import create_image_preprocessor
+from pixr.data import create_image_preprocessor, ImagePreprocessorFactory
 from pixr.framework import DeviceEnv, Monitor, TaskTrain, TaskTrainCfg
 from .common import init_model_and_tokenizer, checkpoint_extra_state, to_device, trim_padding
 from .task_cruller_eval_docvqa import DOCVQA_START_TOKEN, DOCVQA_TOKENS, DocVqaEvaluator, docvqa_task_cfg, \
@@ -81,6 +81,7 @@ class TaskCrullerFinetuneDocVqa(TaskTrain):
             self.input_info['image_fmt'],
             text_process_fn=self.text_preprocess_train,
             is_training=True,
+            image_process_factory=ImagePreprocessorFactory(self.input_info, True, self.cfg.image_transforms),
         )
 
     def eval_data_cfg(self):

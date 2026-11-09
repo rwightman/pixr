@@ -139,6 +139,7 @@ class TaskTrain(Task):
             self,
             num_batches_per_interval: int,
             resume: Optional[str] = "",
+            mean_batch_size: Optional[float] = None,
     ):
         """
         Training duration is 'interval' based. An interval is a full dataset epoch, or a fixed # of samples
@@ -149,6 +150,7 @@ class TaskTrain(Task):
             num_batches_per_interval: pass info from data pipeline for LR scheduling
             resume: path of checkpoint to resume training (model + optimizer + schedule state) from
         """
+        self.mean_batch_size = mean_batch_size
         self.model.to(self.device_env.device)
         if self.cfg.opt.grad_checkpointing:
             self.model.set_grad_checkpointing()
@@ -260,11 +262,23 @@ class TaskTrain(Task):
         sync_ctx = self.model.no_sync if (self.has_no_sync and not need_update) else nullcontext
         with sync_ctx():
             output, loss = self._forward(sample)
-            train_loss = self._loss(loss)
+            train_loss = self._loss(loss) * self._batch_loss_scale(sample)
             if accum_steps > 1:
                 train_loss = train_loss / accum_steps
             self._backward(train_loss, need_update=need_update)
         return output, loss, need_update
+
+    def _batch_loss_scale(self, sample) -> float:
+        mode = self.cfg.opt.loss_batch_scale
+        if mode == 'none' or not getattr(self, 'mean_batch_size', None):
+            return 1.0
+        x = sample['image_input']
+        batch_size = (x['patches'] if isinstance(x, dict) else x).shape[0]
+        ratio = batch_size / self.mean_batch_size
+        if mode == 'linear':
+            return ratio
+        assert mode == 'sqrt', f'Unknown loss_batch_scale {mode}'
+        return ratio ** 0.5
 
     def _after_update(self, updated=True):
         self.batch_idx += 1
