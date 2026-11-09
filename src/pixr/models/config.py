@@ -136,7 +136,7 @@ class ModelCfg(Serializable):
 class ModelArgs:
     """ Model selection + common overrides from the command line. """
     # specify a preset model configuration to load
-    name: str = "cruller_base"
+    name: str = "cruller_naflex_siglip2_base"
 
     # common overrides
     image_fmt: Optional[str] = None
@@ -146,6 +146,10 @@ class ModelArgs:
     text_num_layers: Optional[int] = None
     drop_path_rate: Optional[float] = None
     pretrained: Optional[bool] = None  # override pretrained (init from hub weights) for both towers
+    # attention backend overrides (see config field comments for valid options)
+    image_attn_backend: Optional[str] = None  # image_encoder.attn_backend
+    cross_attn_backend: Optional[str] = None  # text_decoder.cross_attn_backend
+    self_attn_backend: Optional[str] = None  # text_decoder.self_attn_backend, or the cronut trunk attn_backend
 
     def resolve(self) -> ModelCfg:
         """ Load the named model config and apply any overrides. """
@@ -170,11 +174,21 @@ class ModelArgs:
             enc_updates['max_seq_len'] = self.max_seq_len
         if self.drop_path_rate is not None:
             enc_updates['drop_path_rate'] = self.drop_path_rate
+        if self.image_attn_backend is not None:
+            enc_updates['attn_backend'] = self.image_attn_backend
         dec_updates = {}
         if self.text_max_length is not None:
             dec_updates['max_length'] = self.text_max_length
         if self.text_num_layers is not None:
             dec_updates['num_layers'] = self.text_num_layers
+        if self.cross_attn_backend is not None:
+            dec_updates['cross_attn_backend'] = self.cross_attn_backend
+        model_updates = {}
+        if self.self_attn_backend is not None:
+            if model_cfg.cronut is not None:
+                model_updates['cronut'] = replace(model_cfg.cronut, attn_backend=self.self_attn_backend)
+            else:
+                dec_updates['self_attn_backend'] = self.self_attn_backend
         if from_checkpoint:
             enc_updates['pretrained'] = False
             dec_updates['pretrained'] = False
@@ -186,6 +200,7 @@ class ModelArgs:
             model_cfg,
             image_encoder=replace(model_cfg.image_encoder, **enc_updates),
             text_decoder=replace(model_cfg.text_decoder, **dec_updates),
+            **model_updates,
         )
 
 

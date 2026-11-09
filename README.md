@@ -34,7 +34,8 @@ Three model families share the same tasks, data pipelines, loss masking and (gre
 * **Cruller** -- image encoder + autoregressive text decoder w/ cross-attention (Donut style)
 * **Fritter** -- image encoder -> (optional m x m token merge) -> projector -> image token prefix for a decoder-only
   LM w/ prefix-LM attention (PaLI / LLaVA style)
-* **Cronut** -- native decoder-only transformer over image patches and text (placeholder, not implemented yet)
+* **Cronut** -- native decoder-only transformer over image patches and text (GenLIP style single trunk w/ 2D/1D
+  interleaved MRoPE, qk-norm, gated attention, SwiGLU), trained from scratch w/ a tiktoken tokenizer
 
 Model configs live in `src/pixr/models/configs`:
 
@@ -51,11 +52,36 @@ Model configs live in `src/pixr/models/configs`:
 | `fritter_naflex_siglip2_base_ettin150m` | NaFlexVit B/16 SigLIP2, 2x2 token merge | Ettin decoder 150M (prefix-LM) |
 | `fritter_naflex_siglip2_base_ettin400m` | as above | Ettin decoder 400M (prefix-LM) |
 | `fritter_naflex_siglip2_so400m_ettin1b` | NaFlexVit SO400M/16 SigLIP2, 2x2 token merge | Ettin decoder 1B (prefix-LM) |
+| `cruller_naflex_siglip2_base_qwen3_0.6b` | NaFlexVit B/16 SigLIP2 | Qwen3 0.6B + zero init cross-attn every N layers |
+| `fritter_naflex_siglip2_base_qwen3_0.6b` | NaFlexVit B/16 SigLIP2, 2x2 token merge | Qwen3 0.6B (prefix-LM) |
+| `cronut_s16_tiktoken` / `cronut_b16_tiktoken` | -- (patch embed in trunk) | -- (single trunk), `cl100k_base` |
 | `cruller_vit_clip_base_1280` | fixed size ViT B/16 CLIP @ 1280x960 | BART base (6L) |
 | `cruller_hybrid_r50_base_1280` | fixed size hybrid R50 + ViT B/16 @ 1280x960 | BART base (6L) |
 
 NaFlex models consume pages at their native aspect ratio, resized to fit a patch budget (`--task.model.max-seq-len`),
 the budget can be changed between pretraining and fine-tuning.
+
+Ettin (ModernBERT) decoders use 64 token sliding window attention in 2 of every 3 layers, a poor fit for a long
+image prefix (Fritter), Qwen3 (full attention) is the recommended prefix-LM decoder.
+
+### Attention backends
+
+Padded NaFlex sequences can use a dense mask or a variable length kernel, selected per model config field:
+
+| field | options |
+|---|---|
+| `image_encoder.attn_backend` | `sdpa` (dense mask), `sdpa_auto`, `varlen` (packed, CUDA), `flex` (FlexAttention block mask) -- requires the timm `naflex-attn-backends` branch |
+| `text_decoder.cross_attn_backend` | `sdpa`, `varlen`, `flex` |
+| `text_decoder.self_attn_backend` | `sdpa` (dense prefix-LM mask), `flex` (prefix-LM block mask), Ettin / Qwen3 |
+| `cronut.attn_backend` | `sdpa`, `flex` |
+
+Override from the command line w/ `--task.model.image-attn-backend`, `--task.model.cross-attn-backend`, and
+`--task.model.self-attn-backend` (decoder self-attention, or the Cronut trunk), e.g. `--task.model.image-attn-backend flex`.
+
+### Tokenizers
+
+HF tokenizers by name (`facebook/bart-base`, `Qwen/Qwen3-0.6B`, ...) or tiktoken encodings via `tiktoken:<encoding>`
+(`tiktoken:cl100k_base`, `tiktoken:o200k_base`, ...), w/ eos / pad / bos and task tokens appended above the base vocab.
 
 ## Usage
 
@@ -75,8 +101,31 @@ CHECKPOINT=output/pretrain_cruller_naflex_clip_base_idl/checkpoints/checkpoint-l
 CHECKPOINT=output/finetune_docvqa/checkpoints/checkpoint-latest.pt ./scripts/eval_docvqa.sh
 ```
 
-Any config field can be set from the command line w/ dotted names (`--task.opt.learning-rate 1e-4`), or from a yaml
-file via `--config`. The full resolved config is written to `<output_dir>/<experiment>/config.yaml`.
+### Command line / config
+
+Apps are configured by dataclasses parsed w/ [jsonargparse](https://github.com/omni-us/jsonargparse):
+
+* `--task read|docvqa` selects the task (and the type of the `task` config section), default `read` for train
+* nested fields map to dotted args, written w/ dashes: `--trainer.opt.learning-rate 1e-4` (underscores also accepted)
+  * `--task.*` -- task: model, tokenizer, image transforms, dtype / amp, max text length, eval generation
+  * `--trainer.*` -- optimization: intervals, warmup, optimizer / schedule (`--trainer.opt.*`), EMA, compile, grad ckpt
+  * `--train-data.*` / `--eval-data.*` -- chugr data args (source, format, split, batch size, workers, NaFlex batching)
+* `--config file.yaml` loads a config (CLI args override), `--print-config` dumps the resolved config, `--help` lists all
+* lists are passed as `--train-data.naflex-seq-lens [1024,2048,4096]`
+
+The full resolved config is written to `<output_dir>/<experiment>/config.yaml` and can be passed back via `--config`.
+
+### NaFlex batching
+
+For NaFlex models the train loader can draw a sequence length per batch and size the batch to a token budget, w/
+samples resized to the batch's patch budget (rank-identical schedule, from OpenCLIP's streaming NaFlex loader):
+
+```bash
+--train-data.naflex-seq-lens [1024,2048,4096] --train-data.naflex-seq-len-probs [0.25,0.25,0.5] \
+--train-data.naflex-max-tokens 65536 --train-data.naflex-text-tokens 512 --trainer.opt.loss-batch-scale sqrt
+```
+
+`--train-data.length-bucketing true` groups samples of similar target text length. Neither requires resampled shards.
 
 Checkpoints include the resolved model config and the tokens added to the tokenizer, so fine-tuning and evaluation
 only need `--checkpoint-path`, task tokens are appended and their embeddings initialized from the mean embedding.
@@ -89,11 +138,13 @@ Within `src/pixr`:
   * `app/eval.py` - main evaluation CLI entrypoint
 * `data/` - data loaders, image and text preprocessing
 * `framework/` - lightweight train & evaluation scaffolding on top of canonical PyTorch
+  * `framework/task.py` - `TrainingTask` base (model + objective + eval)
+  * `framework/trainer.py` - `Trainer` (optimizer, LR schedule, AMP, grad accumulation, DDP / compile, EMA, train state)
 * `models/` - modelling code with associated factory methods and helpers
-* `task/` - task wrappers for various objectives (model + loss fn + pre/post-processing + optimization nuances)
+* `task/` - tasks (`read` pretraining, `docvqa` fine-tune), registered in `task/task_registry.py`
 * `tokenizers/` - tokenizer creation and task token handling
 * `generation.py` - batched, KV cached greedy decoding
-* `utils/` - misc utils that don't have a home
+* `utils/` - misc utils that don't have a home (`utils/cli.py` -- jsonargparse config / CLI parsing)
 
 ## Concepts & Terminology
 
@@ -112,7 +163,12 @@ Examples of tasks conceptually:
     * Captioning
     * ... and more
 
-With the Task concept, the data pipeline exists outside the task. Samples and targets are fed into the task via the step functions. The data pipeline is coupled to the task by passing the pre-processing functions created within the task to the data pipeline on creation.
+With the Task concept, the data pipeline exists outside the task. The data pipeline is coupled to the task by passing the pre-processing functions created within the task to the data pipeline on creation (`task.train_data_cfg()` / `task.eval_data_cfg()`).
+
+A task is a `TrainingTask` (an `nn.Module` wrapping the model) implementing `training_forward(batch) -> (outputs, losses)`,
+optional `train_metrics()`, and `evaluate(loader)`. The generic `Trainer` owns everything else (optimizer, schedule,
+AMP, accumulation, DDP of the task module, compile, EMA, checkpointing state). Tasks are agnostic to the model family,
+Cruller, Fritter and Cronut share the same `prefill` / `step` generation interface.
 
 ### Interval
 
