@@ -117,6 +117,10 @@ class TaskTrain(Task):
         self.scheduler = None
         self.scaler = None
 
+        # throughput tracking (samples / sec between logs)
+        self._rate_time = None
+        self._rate_samples = 0
+
     def autocast(self):
         if self.amp_dtype is None:
             return nullcontext()
@@ -218,6 +222,23 @@ class TaskTrain(Task):
     def total_steps(self):
         return self.num_intervals * self.num_steps_per_interval
 
+    def _track_rate(self, sample):
+        """ Accumulate (global) samples seen for throughput logging. """
+        x = sample['image_input']
+        if isinstance(x, dict):
+            x = x['patches']
+        self._rate_samples += x.shape[0] * self.device_env.world_size
+
+    def _get_rate(self) -> Optional[float]:
+        import time
+        now = time.time()
+        rate = None
+        if self._rate_time is not None:
+            rate = self._rate_samples / max(now - self._rate_time, 1e-6)
+        self._rate_time = now
+        self._rate_samples = 0
+        return rate
+
     def interval_start(self):
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
@@ -228,6 +249,7 @@ class TaskTrain(Task):
         self.interval_idx += 1
 
     def step(self, sample: Dict[str, Any]) -> Tuple[Union[torch.Tensor, Dict[str, Any]], ...]:
+        self._track_rate(sample)
         output, loss, updated = self._update(sample)
         self._after_update(updated)
         return output, loss
@@ -304,6 +326,7 @@ class TaskTrain(Task):
                 interval=self.interval_idx,
                 loss=self._loss(loss).item(),
                 lr=self.get_current_lr(),
+                rate=self._get_rate(),
             )
 
     def get_current_lr(self):

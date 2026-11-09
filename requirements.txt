@@ -1,7 +1,9 @@
 torch
-timm
+timm>=1.0.20
 transformers
-webdataset
-simple-parsing
-jiwer
+huggingface_hub
+safetensors
+chug
+Levenshtein
+pyyaml
 fsspec

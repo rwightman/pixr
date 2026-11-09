@@ -7,7 +7,7 @@ def clean_state_dict(state_dict):
 
 def load_checkpoint(path: str, map_location='cpu'):
     with fsspec.open(path, "rb") as f:
-        checkpoint = torch.load(f, map_location=map_location)
+        checkpoint = torch.load(f, map_location=map_location, weights_only=False)
     return checkpoint
 
 
@@ -29,9 +29,8 @@ def get_latest_checkpoint(path: str, pattern: str = "*.pt") -> Optional[str]:
     Returns:
         The path to the latest checkpoint file, or None if no files are found.
     """
-    fs = fsspec.filesystem('file') if path.startswith('/') else fsspec.filesystem('s3') 
-
-    files = fs.glob(f'{path}/{pattern}')
+    fs, path = fsspec.core.url_to_fs(path)
+    files = [f for f in fs.glob(f'{path}/{pattern}') if not f.endswith('-latest.pt')]
     files_with_mtime = [(file, fs.info(file)['mtime']) for file in files]
     files_with_mtime.sort(key=lambda x: x[1], reverse=True)
     return files_with_mtime[0][0] if files_with_mtime else None

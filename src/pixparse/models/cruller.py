@@ -6,7 +6,17 @@ import torch.nn as nn
 
 from .config import ModelCfg
 from .image_encoder_timm import ImageEncoderTimm
+from .config import TextDecoderCfg
 from .text_decoder import TextDecoder
+from .text_decoder_ettin import EttinTextDecoder
+
+
+def create_text_decoder(cfg: TextDecoderCfg, vocab_size: int, pad_token_id: int):
+    if cfg.type == 'bart':
+        return TextDecoder(cfg, vocab_size=vocab_size, pad_token_id=pad_token_id)
+    elif cfg.type == 'ettin':
+        return EttinTextDecoder(cfg, vocab_size=vocab_size, pad_token_id=pad_token_id)
+    raise ValueError(f'Unknown text decoder type {cfg.type}')
 
 
 class Cruller(nn.Module):
@@ -14,7 +24,7 @@ class Cruller(nn.Module):
 
     def __init__(self, cfg: ModelCfg, vocab_size: int, pad_token_id: int = 1):
         super().__init__()
-        self.text_decoder = TextDecoder(cfg.text_decoder, vocab_size=vocab_size, pad_token_id=pad_token_id)
+        self.text_decoder = create_text_decoder(cfg.text_decoder, vocab_size=vocab_size, pad_token_id=pad_token_id)
         self.image_encoder = ImageEncoderTimm(cfg.image_encoder, out_dim=self.text_decoder.dim)
         # resolved config, sufficient to rebuild the model architecture (w/o pretrained weights)
         self.cfg = replace(cfg, image_encoder=self.image_encoder.cfg, text_decoder=self.text_decoder.cfg)

@@ -118,6 +118,7 @@ class TaskCrullerPretrain(TaskTrain):
                 interval=self.interval_idx,
                 loss=loss.item(),
                 lr=self.get_current_lr(),
+                rate=self._get_rate(),
                 metrics=metrics,
                 eval_data=eval_data,
             )

@@ -3,3 +3,5 @@ from .cruller import Cruller
 from .factory import create_model, load_model_state
 from .image_encoder_timm import ImageEncoderTimm
 from .text_decoder import TextDecoder
+from .text_decoder_ettin import EttinTextDecoder
+from .cruller import create_text_decoder

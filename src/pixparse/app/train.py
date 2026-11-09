@@ -131,6 +131,8 @@ def main(argv=None):
         train_cfg.save(os.path.join(experiment_path, 'config.yaml'))
 
     setup_logging(log_path if device_env.is_primary() else None)
+    if not device_env.is_primary():
+        logging.root.setLevel(logging.WARNING)
     _logger.info(f"Device env is {device_env}")
     if device_env.is_primary():
         _logger.info('Train config:\n' + train_cfg.dumps_yaml())

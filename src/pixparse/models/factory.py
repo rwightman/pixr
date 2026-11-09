@@ -49,19 +49,18 @@ def create_model(
 @torch.no_grad()
 def load_model_state(model: torch.nn.Module, state_dict, strict: bool = True):
     """ Load model weights, adapting token embedding rows if the vocab grew. """
-    state_dict = clean_state_dict(state_dict)
+    state_dict = dict(clean_state_dict(state_dict))
     own = model.state_dict()
-    key = 'text_decoder.embed_tokens.weight'
-    if key in state_dict and state_dict[key].shape != own[key].shape:
-        src = state_dict[key]
-        dst = own[key].clone()
-        assert src.shape[0] <= dst.shape[0], \
-            f'Checkpoint vocab ({src.shape[0]}) larger than model vocab ({dst.shape[0]}).'
-        dst[:src.shape[0]] = src
-        dst[src.shape[0]:] = src.mean(0, keepdim=True)
-        state_dict = dict(state_dict)
-        state_dict[key] = dst
-        _logger.info(f'Expanded token embeddings {src.shape[0]} -> {dst.shape[0]}.')
+    for key in ('text_decoder.embed_tokens.weight', 'text_decoder.output_bias'):
+        if key in state_dict and key in own and state_dict[key].shape != own[key].shape:
+            src = state_dict[key]
+            dst = own[key].clone()
+            assert src.shape[0] <= dst.shape[0], \
+                f'Checkpoint vocab ({src.shape[0]}) larger than model vocab ({dst.shape[0]}).'
+            dst[:src.shape[0]] = src
+            dst[src.shape[0]:] = src.mean(0, keepdim=True)
+            state_dict[key] = dst
+            _logger.info(f'Expanded {key} {src.shape[0]} -> {dst.shape[0]}.')
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if strict and (missing or unexpected):
         raise RuntimeError(f'Error loading model state. Missing: {missing}, unexpected: {unexpected}')

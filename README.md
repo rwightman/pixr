@@ -11,173 +11,73 @@ Broadly focused on these model types:
 
 The training objectives and pretraining datasets will also be inspired by the associated papers above, but will mix and match. For example, we may train a Donut or PaLI-X style model with a Pix2Struct objective (masked document images w/ simplified HTML target text).
 
+## Status (revive branch)
+
+The `revive` branch ports `pixparse` to `chug` 0.2, NaFlexVit (native aspect / variable resolution) image encoders,
+a self-contained text decoder, and fixes a number of issues that hampered the original DocVQA results:
+
+* DocVQA fine-tune loss was applied to question + answer tokens (prompt masking used the task start token)
+* train / eval image preprocessing mismatched (aspect preserving resize + pad vs stretch, long axis rotation)
+* DocVQA eval decoded by re-tokenizing the generated string each step (BPE round trip is not idempotent)
+* `scale_embedding` was forced on for BART decoders (copied from Donut's mBART, BART is trained w/o)
+* `ModelArgs` command line overrides (image size, etc) were silently dropped
+* pretrained BART cross-attention weights significantly slow learning w/ an image encoder, cross-attention is now
+  re-initialized w/ zero init output projections by default (decoder starts as the pretrained LM)
+
+## Models
+
+Model configs live in `src/pixparse/models/configs`:
+
+| config | image encoder | text decoder |
+|---|---|---|
+| `cruller_naflex_clip_base` | NaFlexVit B/16, CLIP style (pre-norm, cls token), OpenAI CLIP init, 4096 patches | BART base (6L) |
+| `cruller_naflex_clip_base_8k` | as above, 8192 patches | BART base (6L) |
+| `cruller_naflex_clip_base_ettin150m` | as above, 4096 patches | Ettin (ModernBERT) decoder 150M + cross-attn |
+| `cruller_naflex_siglip2_base` | NaFlexVit B/16 SigLIP2 | BART base (6L) |
+| `cruller_naflex_clip_large` | NaFlexVit L/14 CLIP style, OpenAI CLIP init, 6144 patches | BART large (8L) |
+| `cruller_naflex_clip_large_ettin400m` | as above | Ettin decoder 400M + cross-attn |
+| `cruller_vit_clip_base_1280` | fixed size ViT B/16 CLIP @ 1280x960 | BART base (6L) |
+| `cruller_hybrid_r50_base_1280` | fixed size hybrid R50 + ViT B/16 @ 1280x960 | BART base (6L) |
+
+NaFlex models consume pages at their native aspect ratio, resized to fit a patch budget (`--task.model.max-seq-len`),
+the budget can be changed between pretraining and fine-tuning.
+
 ## Usage
 
-To launch a pretraining Cruller Task on IDL data, you would need these arguments in these scopes. The task-name argument selects which task is to be run, in this case cruller_pretrain. 
+Scripts in `scripts/` cover the main workflow, see each script for env var options.
 
 ```bash
-python -m pixparse.app.train \
-  --task-name cruller_pretrain \
-  --data.train.source "pipe:aws s3 cp s3://url-to-IDL-webdataset-shards/idl_shard-00{000..699}.tar -" \
-  --data.train.batch-size 8 \
-  --data.train.num-samples 800000 \
-  --data.train.num-workers 8 \
-  --task.model-name cruller_large \
-  --task.opt.clip-grad-value 1.0 \
-  --task.opt.clip-grad-mode norm \
-  --task.opt.learning-rate 3e-4 \
-  --task.opt.grad-accum-steps 1 \
-  --task.opt.betas 0.9 0.98 \
-  --task.dtype bfloat16 \
-  --task.num-intervals 30 \
-  --task.num-warmup-intervals 3 \
-  --train.checkpoint-dir <your_checkpoint_dir> \
-  --train.output-dir <where logs and tb files are created> \
-  --train.experiment awesome_experiment\
-  --train.tensorboard True \
-  --train.log-eval-data False \
-  --train.wandb False \
-  --train.log-filename out.log
+# 1. pretrain (read all text on a page) on IDL, streamed from the HF hub
+NUM_GPUS=2 MODEL=cruller_naflex_clip_base ./scripts/pretrain_idl.sh
 
+# held out reading CER / WER
+CHECKPOINT=output/pretrain_cruller_naflex_clip_base_idl/checkpoints/checkpoint-latest.pt ./scripts/eval_ocr.sh
+
+# 2. fine-tune on DocVQA (ANLS on validation each eval interval)
+CHECKPOINT=output/pretrain_cruller_naflex_clip_base_idl/checkpoints/checkpoint-latest.pt ./scripts/finetune_docvqa.sh
+
+# 3. evaluate (validation ANLS, or SPLIT=test for an eval server submission file)
+CHECKPOINT=output/finetune_docvqa/checkpoints/checkpoint-latest.pt ./scripts/eval_docvqa.sh
 ```
 
-To launch evaluation on existing checkpoints, you need to use a Cruller Eval Task, e.g. on FUNSD dataset. The task-name argument will select which task is to be run. donut_eval_ocr, for instance, runs Donut as an OCR engine on the dataset chosen and does not need external checkpoints.
+Any config field can be set from the command line w/ dotted names (`--task.opt.learning-rate 1e-4`), or from a yaml
+file via `--config`. The full resolved config is written to `<output_dir>/<experiment>/config.yaml`.
 
-```bash
-python -m pixparse.app.eval \
-  --eval.task-name cruller_eval_ocr \
-  --data.eval.source "pipe:aws s3 cp s3://.../FUNSD/FUNSD-000000.tar -" \
-  --data.eval.num-samples 200 \
-  --data.eval.batch-size 16 \
-  --data.eval.num-workers 8 \
-  --model-name cruller_large_6layers \
-  --task.dtype bfloat16 \
-  --s3-bucket pixparse-exps \
-  --resume True 
-  --eval.checkpoint-path 20230629-231529-model_cruller_large-lr_0.0003-b_12/checkpoints/checkpoint-29.pt \
-  --output-dir /fsx/pablo/
-```
-
-metrics will be saved under output_dir, with a name derived from the checkpoint used. 
-
-To finetune a pretrained pixparse model on RVLCDIP json completion: 
-```bash
-python -m pixparse.app.train \
-  --task-name cruller_finetune_rvlcdip \
-  --data.train.source aharley/rvl_cdip \
-  --data.train.format hf_dataset \
-  --data.train.split train \
-  --data.train.batch-size 32 \
-  --data.train.num-samples 320000 \
-  --data.train.num-workers 8 \
-  --model-name cruller_base \
-  --task.opt.clip-grad-value 1.0 \
-  --task.opt.clip-grad-mode norm \
-  --task.opt.learning-rate 1e-4 \
-  --task.opt.grad-accum-steps 1 \
-  --task.opt.betas 0.9 0.99 \
-  --task.dtype bfloat16 \
-  --task.num-intervals  \
-  --task.num-warmup-intervals 1 \
-  --train.resume True \
-  --train.checkpoint-path /fsx/pablo/training_pixparse/cruller_Aug11th_base_30/checkpoint-8.pt \
-  --train.output-checkpoint-dir /fsx/pablo/training_pixparse/ \
-  --train.output-dir /fsx/pablo/training_pixparse/outputs/ \
-  --train.tensorboard True \
-  --train.log-eval-data False \
-  --train.wandb False \
-  --train.log-filename out.log
-```
-To evaluate a model finetuned on RVLCDIP:
-
-```bash
-python -m pixparse.app.eval \
-  --task-name cruller_eval_rvlcdip \
-  --data.eval.source aharley/rvl_cdip \
-  --data.eval.format hf_dataset \
-  --data.eval.split test \
-  --data.eval.num-samples 40000 \
-  --data.eval.batch-size 16 \
-  --data.eval.num-workers 8 \
-  --model-name cruller_base \
-  --task.dtype bfloat16 \
-  --output-dir /fsx/pablo/metrics_finetune \
-  --eval.checkpoint-path "/fsx/pablo/training_pixparse/20230823-151033-task_cruller_finetune_rvlcdip-model_cruller_base-lr_1.0e-04-b_32/checkpoint-4.pt" \
-```
-This will write the accuracy metrics in metrics_finetune directory.
-
-
-To finetune a model on CORD dataset:
-
-```bash
-python -m pixparse.app.train \
-  --task-name cruller_finetune_cord \
-  --data.train.source naver-clova-ix/cord-v2 \
-  --data.train.format hf_dataset \
-  --data.train.split train \
-  --data.train.batch-size 32 \
-  --data.train.num-samples 800 \
-  --data.train.num-workers 8 \
-  --model-name cruller_base \
-  --task.opt.clip-grad-value 1.0 \
-  --task.opt.clip-grad-mode norm \
-  --task.opt.learning-rate 3e-4 \
-  --task.opt.grad-accum-steps 1 \
-  --task.opt.betas 0.9 0.99 \
-  --task.opt.layer-decay 0.75 \
-  --task.dtype bfloat16 \
-  --task.num-intervals 30 \
-  --task.num-warmup-intervals 3 \
-  --train.resume True \
-  --train.checkpoint-path /fsx/pablo/training_pixparse/cruller_Aug11th_base_30/checkpoint-8.pt \
-  --train.output-checkpoint-dir /fsx/pablo/training_pixparse/ \
-  --train.output-dir /fsx/pablo/training_pixparse/outputs/ \
-  --train.tensorboard True \
-  --train.log-eval-data False \
-  --train.wandb False \
-  --train.log-filename out.log
-```
-
-To evaluate a model on CORD dataset:
-
-```bash
-python -m pixparse.app.eval \
-  --task-name cruller_eval_cord \
-  --data.eval.source naver-clova-ix/cord-v2 \
-  --data.eval.format hf_dataset \
-  --data.eval.split test \
-  --data.eval.num-samples 100 \
-  --data.eval.batch-size 16 \
-  --data.eval.num-workers 8 \
-  --model-name cruller_base \
-  --task.dtype bfloat16 \
-  --output-dir /fsx/pablo/metrics_finetune \
-  --eval.checkpoint-path /fsx/pablo/training_pixparse/20230830-133114-task_cruller_finetune_cord-model_cruller_base-lr_3.0e-05-b_8/checkpoint-29.pt \
-
-```
-## Updates
-
-2023-06-14
-* Distributed training tested in a SLURM environment w/ 16x A100 over 2 nodes.
-
-2023-06-12
-* It performs train steps on image-text datasets (objective too hard to learn anything w/o text in image)
-  * `python -m pixparse.app.train --train.source "/data/cc12m/cc12m-train-{0000..xxxx}.tar" --train.batch-size 8 --train.num-samples 10000000 --learning-rate 1e-4 --clip-grad-value 1.0 --clip-grad-mode norm --grad-accum-steps 4`
-* Next step, trial image + ocr anno dataset
+Checkpoints include the resolved model config and the tokens added to the tokenizer, so fine-tuning and evaluation
+only need `--checkpoint-path`, task tokens are appended and their embeddings initialized from the mean embedding.
 
 ## Code Organization
 
 Within `src/pixparse`:
 * `app/` - CLI applications for training and evaluation
   * `app/train.py` - main training CLI entrypoint, will attempt to keep useable across tasks
-  * `app/eval.py` - (TODO) main evaluation CLI entrypoint
-  * `app/finetune.py` - (TBD) fine-tune is handled by train.py with different args/config or separate?
+  * `app/eval.py` - main evaluation CLI entrypoint
 * `data/` - data loaders, image and text preprocessing
 * `framework/` - lightweight train & evaluation scaffolding on top of canonical PyTorch
-* `layers/` - custom nn.Modules and functions for re-usable modelling components
 * `models/` - modelling code with associated factory methods and helpers
 * `task/` - task wrappers for various objectives (model + loss fn + pre/post-processing + optimization nuances)
-* `tokenizer/` - tokenizer helpers (push into data?)
+* `tokenizers/` - tokenizer creation and task token handling
+* `generation.py` - batched, KV cached greedy decoding
 * `utils/` - misc utils that don't have a home
 
 ## Concepts & Terminology

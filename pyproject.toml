@@ -10,7 +10,7 @@ authors = [
 ]
 description = ""
 readme = "README.md"
-requires-python = ">=3.7"
+requires-python = ">=3.10"
 keywords = ["document", "document-ai", "transformers", "ocr", "scale"]
 license = {text = "Apache-2.0"}
 classifiers = [
@@ -30,10 +30,14 @@ classifiers = [
         'Topic :: Software Development :: Libraries :: Python Modules',
 ]
 dependencies = [
-    "timm",
-    "transformers",
-    "simple-parsing",
+    "torch",
+    "timm>=1.0.20",
+    "transformers",  # tokenizers only
+    "huggingface_hub",
+    "safetensors",
     "chug",
+    "Levenshtein",
+    "pyyaml",
 ]
 dynamic = ["version"]
 
