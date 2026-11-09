@@ -81,7 +81,7 @@ class Projector(nn.Module):
 class Fritter(nn.Module):
     def __init__(self, cfg: ModelCfg, vocab_size: int, pad_token_id: int = 0):
         super().__init__()
-        assert cfg.text_decoder.type == 'ettin', 'Fritter currently requires an Ettin (decoder-only) text model.'
+        assert cfg.text_decoder.type in ('ettin', 'qwen3'), 'Fritter requires a decoder-only text model (ettin, qwen3).'
         dec_cfg = replace(cfg.text_decoder, cross_attn_every=0)
         self.text_decoder = create_text_decoder(dec_cfg, vocab_size=vocab_size, pad_token_id=pad_token_id)
         self.image_encoder = ImageEncoderTimm(replace(cfg.image_encoder, head_type=None, out_dim=None))
@@ -146,7 +146,7 @@ class Fritter(nn.Module):
             attention_mask=attn_mask,
             cache=cache,
         )
-        state = dict(cache=cache, attn_mask=attn_mask, pos=position_ids[:, -1])
+        state = dict(cache=cache, attn_mask=attn_mask, pos=position_ids[:, -1], prefix_len=prefix.shape[1])
         return logits[:, -1], state
 
     def step(self, token_ids: torch.Tensor, state: Dict[str, Any]):
@@ -157,5 +157,6 @@ class Fritter(nn.Module):
             position_ids=state['pos'][:, None],
             attention_mask=state['attn_mask'],
             cache=state['cache'],
+            prefix_len=state['prefix_len'],
         )
         return logits[:, -1], state

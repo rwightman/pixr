@@ -239,6 +239,7 @@ class EttinTextDecoder(nn.Module):
             cache: Optional[List[Dict[str, torch.Tensor]]] = None,
             prefix_embeds: Optional[torch.Tensor] = None,
             prefix_mask: Optional[torch.Tensor] = None,
+            prefix_len: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -250,6 +251,8 @@ class EttinTextDecoder(nn.Module):
             prefix_embeds: [B, P, C] prefix (e.g. image) embeddings, prepended to the text, bidirectional
                 attention within the prefix (prefix-LM). Only valid w/o past cache (training or prefill).
             prefix_mask: [B, P] bool validity of prefix positions
+            prefix_len: length of a prefix already in the cache (incremental decoding), so sliding window layers
+                keep full visibility of the prefix
 
         Returns:
             logits [B, T, V] for the text positions only
@@ -294,6 +297,10 @@ class EttinTextDecoder(nn.Module):
         if P > 0:
             allowed = allowed | ((q_idx < P) & (k_idx < P))  # bidirectional prefix
         local = allowed & (k_idx > q_idx - self.sliding_window) & (k_idx < q_idx + self.sliding_window)
+        full_prefix = P if P > 0 else (prefix_len or 0)
+        if full_prefix > 0:
+            # text queries see the entire prefix in sliding window layers too (window applies within prefix / text)
+            local = local | (allowed & (k_idx < full_prefix) & (q_idx >= full_prefix))
         if attention_mask is not None:
             key_valid = attention_mask[:, None, None, :S].bool()
             diag = k_idx == q_idx

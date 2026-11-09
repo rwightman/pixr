@@ -13,6 +13,9 @@ def create_tokenizer(cfg: TokenizerCfg, added_tokens: Optional[Sequence[str]] = 
     """
     assert cfg.name
     tokenizer = AutoTokenizer.from_pretrained(cfg.name)
+    if tokenizer.pad_token is None or tokenizer.pad_token_id == tokenizer.eos_token_id:
+        # a pad token distinct from eos is required, padding is excluded from the loss (eos must be learned)
+        tokenizer.add_special_tokens({'pad_token': '<|pad|>'})
     if added_tokens:
         add_tokens(tokenizer, added_tokens)
     return tokenizer

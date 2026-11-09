@@ -188,3 +188,17 @@ def test_cronut_placeholder():
     cfg = ModelCfg(type='cronut', image_encoder=cfg.image_encoder, text_decoder=cfg.text_decoder)
     with pytest.raises(NotImplementedError):
         create_model(cfg, vocab_size=100)
+
+
+def test_qwen3_decoder_matches_hf():
+    import transformers
+    from pixparse.models import Qwen3TextDecoder
+    torch.manual_seed(0)
+    cfg = TextDecoderCfg(type='qwen3', name='Qwen/Qwen3-0.6B-Base', num_layers=None, max_length=256, cross_attn_every=0)
+    dec = Qwen3TextDecoder(cfg, vocab_size=151936, pad_token_id=151669).eval()
+    hf = transformers.AutoModelForCausalLM.from_pretrained('Qwen/Qwen3-0.6B-Base', dtype=torch.float32).eval()
+    ids = torch.randint(10, 150000, (2, 40))
+    with torch.no_grad():
+        a = hf(input_ids=ids).logits
+        b = dec(ids)
+    assert torch.allclose(a, b, atol=1e-3)

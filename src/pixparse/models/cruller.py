@@ -8,6 +8,7 @@ from .config import ModelCfg, TextDecoderCfg
 from .image_encoder_timm import ImageEncoderTimm
 from .text_decoder import TextDecoder
 from .text_decoder_ettin import EttinTextDecoder
+from .text_decoder_qwen3 import Qwen3TextDecoder
 
 
 def create_text_decoder(cfg: TextDecoderCfg, vocab_size: int, pad_token_id: int):
@@ -15,6 +16,8 @@ def create_text_decoder(cfg: TextDecoderCfg, vocab_size: int, pad_token_id: int)
         return TextDecoder(cfg, vocab_size=vocab_size, pad_token_id=pad_token_id)
     elif cfg.type == 'ettin':
         return EttinTextDecoder(cfg, vocab_size=vocab_size, pad_token_id=pad_token_id)
+    elif cfg.type == 'qwen3':
+        return Qwen3TextDecoder(cfg, vocab_size=vocab_size, pad_token_id=pad_token_id)
     raise ValueError(f'Unknown text decoder type {cfg.type}')
 
 

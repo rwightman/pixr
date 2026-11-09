@@ -51,6 +51,7 @@ class TextDecoderCfg(Serializable):
     Types:
         'bart': BART style post-norm decoder w/ learned positions (e.g. facebook/bart-base)
         'ettin': ModernBERT style pre-norm decoder w/ RoPE, GeGLU, local/global attn (e.g. jhu-clsp/ettin-decoder-150m)
+        'qwen3': Qwen3 decoder-only LM w/ GQA, qk-norm, SwiGLU, RoPE (e.g. Qwen/Qwen3-0.6B-Base), prefix LM only
 
     When `pretrained` is set, architecture hparams are taken from the Hugging Face model `name` and weights
     are loaded from it. Otherwise the arch fields below define a randomly initialized decoder.
@@ -72,8 +73,10 @@ class TextDecoderCfg(Serializable):
     dropout: float = 0.1
     attn_dropout: float = 0.0
     act_dropout: float = 0.0
-    # ettin (ModernBERT) specific
-    cross_attn_every: int = 1  # add cross-attention to every N-th layer
+    # ettin (ModernBERT) / qwen3 specific
+    num_kv_heads: Optional[int] = None  # GQA kv heads (qwen3)
+    head_dim: Optional[int] = None  # (qwen3)
+    cross_attn_every: int = 1  # add cross-attention to every N-th layer (ettin), <= 0 disables
     norm_eps: float = 1e-5
     rope_theta: float = 160000.
     sliding_window: int = 64
