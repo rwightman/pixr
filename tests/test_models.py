@@ -99,9 +99,9 @@ def _tiny_cfg(model_type='cruller'):
         name='naflexvit', pretrained=False, image_fmt='L', max_seq_len=64,
         model_kwargs=dict(patch_size=16, embed_dim=64, depth=2, num_heads=2, class_token=True, pre_norm=True),
     )
-    if model_type == 'eclair':
+    if model_type == 'fritter':
         return ModelCfg(
-            type='eclair',
+            type='fritter',
             image_encoder=image_encoder,
             text_decoder=TextDecoderCfg(
                 type='ettin', pretrained=False, num_layers=3, dim=64, num_heads=2, ffn_dim=96, max_length=64,
@@ -133,7 +133,7 @@ def test_merge_patch_tokens():
     assert torch.equal(merged, ref)
 
 
-@pytest.mark.parametrize('model_type', ['cruller', 'eclair'])
+@pytest.mark.parametrize('model_type', ['cruller', 'fritter'])
 def test_greedy_matches_teacher_forced(model_type):
     torch.manual_seed(0)
     model = create_model(_tiny_cfg(model_type), vocab_size=100, pad_token_id=1).eval()
@@ -153,7 +153,7 @@ def test_ettin_prefix_lm_mask():
     """ Prefix tokens attend bidirectionally (changing a later prefix token changes earlier prefix outputs is
     not observable from text logits, so check text logits depend on all prefix tokens and causality of text). """
     torch.manual_seed(0)
-    dec = EttinTextDecoder(_tiny_cfg('eclair').text_decoder, vocab_size=100, pad_token_id=1).eval()
+    dec = EttinTextDecoder(_tiny_cfg('fritter').text_decoder, vocab_size=100, pad_token_id=1).eval()
     prefix = torch.randn(1, 6, 64)
     ids = torch.randint(3, 100, (1, 5))
     with torch.no_grad():
@@ -181,3 +181,10 @@ def test_checkpoint_vocab_expansion(tmp_path):
     assert torch.equal(w1, w2[:100])
     assert torch.allclose(w2[100:], w1.mean(0, keepdim=True).expand(5, -1))
 
+
+
+def test_cronut_placeholder():
+    cfg = _tiny_cfg()
+    cfg = ModelCfg(type='cronut', image_encoder=cfg.image_encoder, text_decoder=cfg.text_decoder)
+    with pytest.raises(NotImplementedError):
+        create_model(cfg, vocab_size=100)

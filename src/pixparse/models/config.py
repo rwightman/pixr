@@ -86,12 +86,13 @@ class ModelCfg(Serializable):
 
     Types:
         'cruller': image encoder + text decoder w/ cross-attention (Donut style)
-        'eclair': image encoder + projector -> image token prefix for a decoder-only LM (prefix-LM attention)
+        'fritter': image encoder + projector -> image token prefix for a decoder-only LM (prefix-LM attention)
+        'cronut': native decoder-only image + text transformer (placeholder, not implemented yet)
     """
     type: str = 'cruller'
     image_encoder: ImageEncoderCfg = field(default_factory=ImageEncoderCfg)
     text_decoder: TextDecoderCfg = field(default_factory=TextDecoderCfg)
-    # eclair (prefix) specific
+    # fritter (prefix) specific
     prefix_token_merge: int = 1  # merge m x m patch tokens before projection (reduces prefix length by m^2)
     projector_type: str = 'mlp'  # image -> text embedding projector ('mlp', 'linear')
 

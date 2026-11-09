@@ -1,13 +1,13 @@
 {
-    "type": "eclair",
+    "type": "fritter",
     "image_encoder": {
-        "name": "naflexvit_so400m_patch16_siglip.v2_webli",
+        "name": "naflexvit_base_patch16_siglip.v2_webli",
         "image_fmt": "L",
         "max_seq_len": 4096
     },
     "text_decoder": {
         "type": "ettin",
-        "name": "jhu-clsp/ettin-decoder-1b",
+        "name": "jhu-clsp/ettin-decoder-400m",
         "pretrained": true,
         "num_layers": null,
         "max_length": 1024,

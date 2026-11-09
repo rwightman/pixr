@@ -26,6 +26,13 @@ a self-contained text decoder, and fixes a number of issues that hampered the or
 
 ## Models
 
+Three model families share the same tasks, data pipelines, loss masking and (greedy, KV cached) generation:
+
+* **Cruller** -- image encoder + autoregressive text decoder w/ cross-attention (Donut style)
+* **Fritter** -- image encoder -> (optional m x m token merge) -> projector -> image token prefix for a decoder-only
+  LM w/ prefix-LM attention (PaLI / LLaVA style)
+* **Cronut** -- native decoder-only transformer over image patches and text (placeholder, not implemented yet)
+
 Model configs live in `src/pixparse/models/configs`:
 
 | config | image encoder | text decoder |
@@ -36,6 +43,11 @@ Model configs live in `src/pixparse/models/configs`:
 | `cruller_naflex_siglip2_base` | NaFlexVit B/16 SigLIP2 | BART base (6L) |
 | `cruller_naflex_clip_large` | NaFlexVit L/14 CLIP style, OpenAI CLIP init, 6144 patches | BART large (8L) |
 | `cruller_naflex_clip_large_ettin400m` | as above | Ettin decoder 400M + cross-attn |
+| `cruller_naflex_siglip2_base_ettin150m` | NaFlexVit B/16 SigLIP2 | Ettin decoder 150M + cross-attn |
+| `cruller_naflex_siglip2_so400m` | NaFlexVit SO400M/16 SigLIP2 | BART large (8L) |
+| `fritter_naflex_siglip2_base_ettin150m` | NaFlexVit B/16 SigLIP2, 2x2 token merge | Ettin decoder 150M (prefix-LM) |
+| `fritter_naflex_siglip2_base_ettin400m` | as above | Ettin decoder 400M (prefix-LM) |
+| `fritter_naflex_siglip2_so400m_ettin1b` | NaFlexVit SO400M/16 SigLIP2, 2x2 token merge | Ettin decoder 1B (prefix-LM) |
 | `cruller_vit_clip_base_1280` | fixed size ViT B/16 CLIP @ 1280x960 | BART base (6L) |
 | `cruller_hybrid_r50_base_1280` | fixed size hybrid R50 + ViT B/16 @ 1280x960 | BART base (6L) |
 

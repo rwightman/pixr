@@ -1,4 +1,4 @@
-""" Eclair: image encoder + projector -> image token prefix for a decoder-only (causal) LM w/ prefix-LM attention.
+""" Fritter: image encoder + projector -> image token prefix for a decoder-only (causal) LM w/ prefix-LM attention.
 
 Sequence: [image tokens (bidirectional)] [text: task start / prompt ... answer (causal)]
 
@@ -78,10 +78,10 @@ class Projector(nn.Module):
         return x
 
 
-class Eclair(nn.Module):
+class Fritter(nn.Module):
     def __init__(self, cfg: ModelCfg, vocab_size: int, pad_token_id: int = 0):
         super().__init__()
-        assert cfg.text_decoder.type == 'ettin', 'Eclair currently requires an Ettin (decoder-only) text model.'
+        assert cfg.text_decoder.type == 'ettin', 'Fritter currently requires an Ettin (decoder-only) text model.'
         dec_cfg = replace(cfg.text_decoder, cross_attn_every=0)
         self.text_decoder = create_text_decoder(dec_cfg, vocab_size=vocab_size, pad_token_id=pad_token_id)
         self.image_encoder = ImageEncoderTimm(replace(cfg.image_encoder, head_type=None, out_dim=None))
