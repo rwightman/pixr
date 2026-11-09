@@ -1,0 +1,30 @@
+{
+    "type": "cruller",
+    "image_encoder": {
+        "name": "naflexvit",
+        "pretrained_from": "vit_base_patch16_clip_quickgelu_224.openai",
+        "model_kwargs": {
+            "patch_size": 16,
+            "embed_dim": 768,
+            "depth": 12,
+            "num_heads": 12,
+            "class_token": true,
+            "pre_norm": true,
+            "act_layer": "quick_gelu",
+            "norm_layer": "layernorm",
+            "pos_embed_grid_size": [
+                14,
+                14
+            ],
+            "pos_embed_interp_mode": "bicubic"
+        },
+        "image_fmt": "L",
+        "max_seq_len": 8192
+    },
+    "text_decoder": {
+        "name": "facebook/bart-base",
+        "pretrained": true,
+        "num_layers": 6,
+        "max_length": 1024
+    }
+}

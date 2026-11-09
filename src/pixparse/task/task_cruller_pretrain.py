@@ -1,213 +1,161 @@
 import logging
-from dataclasses import dataclass, field, asdict
-from functools import partial
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict
 
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 
+import chug
+
+from pixparse.data import create_image_preprocessor
 from pixparse.framework import TaskTrainCfg, TaskTrain, DeviceEnv, Monitor
-from pixparse.models import create_model, ModelArgs
-from pixparse.tokenizers import create_tokenizer, TokenizerCfg
-from pixparse.data import preprocess_ocr_anno, preprocess_text_anno, create_transforms
-from pixparse.utils.ocr_utils import get_ocr_metrics
-
+from pixparse.generation import generate_greedy
+from pixparse.utils import text_error_rates
+from .common import init_model_and_tokenizer, checkpoint_extra_state, image_feature_info, to_device, trim_padding
 
 _logger = logging.getLogger(__name__)
 
 
 @dataclass
 class TaskCrullerPretrainCfg(TaskTrainCfg):
-    model: ModelArgs = field(default_factory=lambda: ModelArgs(
-        name='cruller_base',  # override model default in spec per task
-    ))
-
-    def __post_init__(self):
-        assert self.model.cfg is not None
-        if self.tokenizer is None:
-            # set tokenizer to text tower model name if not explicitly set
-            self.tokenizer = TokenizerCfg(name=self.model.cfg.text_decoder.name)
+    text_max_length: int = 1024  # max target tokens per page
+    page_sampling: str = 'random'  # page sampling for multi-page docs ('random', 'first')
+    render_dpi: int = 150  # pdf render dpi (before resize to model input)
+    num_metrics_samples: int = 4  # number of train samples to decode (greedy) for CER / WER train metrics
+    metrics_max_new_tokens: int = 512
 
 
 class TaskCrullerPretrain(TaskTrain):
-    """ Cruller Pretraining Task
+    """ Cruller Pretraining Task -- read (OCR) all text on a document page, in annotation line order.
 
-    NOTES:
-      * all task code is currently here w/ nothing in base class but interface
-      * we will want to pull out bits that are common to other tasks as we proceed
-         by pushing into base classe(s), stand-alone fn / helper classes, etc.
-      * to setup schedule we need info from data-pipeline re samples, etc so our call sequence is:
-        * Task() -- task __init__() called for instance, setup what we can
-        * Initialize data-pipeline (external to Task) to get batch / step count
+    Call sequence:
+        * Task() -- task __init__() creates tokenizer, model, pre-processing
+        * Initialize data-pipeline (external to Task) w/ task.train_data_cfg() to get batch / step count
         * Call setup() to pass this info back to Task and finish setting up optimizer / scheduler
         * Proceed to train by interval_start()/step() * N/interval_end(), etc
     """
+    task_name = 'cruller_pretrain'
+    task_start_token = '<s_pretrain>'
+
     def __init__(
             self,
             cfg: TaskCrullerPretrainCfg,
             device_env: DeviceEnv,
             monitor: Monitor,
+            checkpoint_path: str = '',
     ):
         super().__init__(
             cfg=cfg,
             device_env=device_env,
             monitor=monitor,
         )
-        model_cfg = self.cfg.model.cfg
-        self.task_start_token = '<s_pretrain>'
         self.prompt_end_token = self.task_start_token
-        self.max_position_embeddings = model_cfg.text_decoder.max_length
-        self.text_anno_fn = False  # set for image-text dataset experiments
-        self.tokenizer = create_tokenizer(cfg.tokenizer)
-        self.model = create_model(
-            model_cfg,
-            pretrained='',  # FIXME pass through tags or paths for full pretrained image-text tower
+        self.model, self.tokenizer = init_model_and_tokenizer(
+            cfg.model,
+            cfg.tokenizer,
+            task_tokens=[self.task_start_token],
+            checkpoint_path=checkpoint_path,
         )
-        self.loss = nn.CrossEntropyLoss(ignore_index=-100)
+        self.pad_token_id = self.tokenizer.pad_token_id
+        self.input_info = self.model.image_encoder.input_info
 
-        # Setup task specific tokens
-        # NOTE: Donut appears to add tokens on the fly during dataset init, requires iterating
-        # through full dataset on train start due to not being able to update once tokenizers
-        # passed through to dataloader processes, we should store this all in configs up front
-        # FIXME this token setup remains a bit of a mess, need better,
-        #  re-usable scheme for updating pretrain vs fine-tune tokens in correct order
-        special_tokens = [
-            "<sep/>",  # JSON list separator
-            self.task_start_token,  # task start (based on dataset/task)
-            self.prompt_end_token,  # prompt end (or task_start for pretrain)
-        ]
-        newly_added_num = self.tokenizer.add_special_tokens(
-            {"additional_special_tokens": sorted(set(special_tokens))}
-        )
-        self.vocab_size = len(self.tokenizer)
-        # We need to resize the token embeddings after the model has been initialized
-        if newly_added_num > 0:
-            self.model.text_decoder.trunk.resize_token_embeddings(len(self.tokenizer))
-
-        # Setup text preprocessing
-        preproc_fn = preprocess_text_anno if self.text_anno_fn else preprocess_ocr_anno
-        self.anno_preprocess_train = partial(
-            preproc_fn,
-            tokenizer=self.tokenizer,
-            max_position_embeddings=self.max_position_embeddings,
+        self.text_preprocess_train = chug.create_text_preprocessor(
+            self.tokenizer,
+            max_length=cfg.text_max_length,
             task_start_token=self.task_start_token,
             prompt_end_token=self.prompt_end_token,
         )
-
-        # Setup image preprocessing
-        self.image_input_cfg = self.model.image_encoder.traits.get('input')
-        self.image_preprocess_train = create_transforms(
-            self.cfg.image_transforms,
-            input_cfg=self.image_input_cfg,
-            training=True,
-            interpolation='bicubic',
-            crop_margin=False,  # True?
-            align_long_axis=False,
+        self.image_preprocess_train = create_image_preprocessor(
+            self.input_info,
+            is_training=True,
+            transform_type=cfg.image_transforms,
         )
-        # TODO init eval when eval tasks are being created from train task
-        self.image_preprocess_eval = None
 
-        # TODO These metrics have to be organized as dicts of dicts. 
-        # First level is the category, second level is the tag
-        # We have to make this clear
-        self.train_metrics = {} 
-        self.max_recursion_length = 1000  # specific to Cruller for generation
+    def train_data_cfg(self):
+        return chug.DataTaskDocReadCfg(
+            image_process_fn=self.image_preprocess_train,
+            text_process_fn=self.text_preprocess_train,
+            image_input_feat=image_feature_info(self.input_info['image_fmt']),
+            page_sampling=self.cfg.page_sampling,
+            render_dpi=self.cfg.render_dpi,
+            error_handler='log_and_continue',
+        )
+
+    def extra_state(self) -> Dict[str, Any]:
+        return checkpoint_extra_state(self.unwrapped_model, self.tokenizer, self.task_name)
 
     def _forward(self, sample: Dict[str, Any]):
-        image_input, text_input, text_target = sample
-        image_input = image_input.to(self.device_env.device, non_blocking=True)
-        text_input = text_input[:, :-1].to(self.device_env.device, non_blocking=True)
-        text_target = text_target[:, 1:].to(self.device_env.device, non_blocking=True)
+        device = self.device_env.device
+        image_input = to_device(sample['image_input'], device)
+        text_input, text_target = trim_padding(sample['text_input'], sample['text_target'], self.pad_token_id)
+        text_input = text_input[:, :-1].to(device, non_blocking=True)
+        text_target = text_target[:, 1:].to(device, non_blocking=True)
 
         with self.autocast():
-            output = self.model(image_input, text_input)
-            logits = output['logits']
-            loss = self.loss(
-                logits.view(-1, self.vocab_size),
-                text_target.view(-1),
+            logits = self.model(image_input, text_input)
+            loss = F.cross_entropy(
+                logits.flatten(0, 1),
+                text_target.flatten(),
+                ignore_index=-100,
+                label_smoothing=self.cfg.opt.label_smoothing,
             )
-        return output, loss
+        return logits, loss
 
     def after_step(self, sample, output, loss):
-        metrics_updated = False
-        if self.step_idx % self.metrics_frequency == 0:
-            metrics, eval_gallery = self.get_ocr_metrics(sample)
-            self.train_metrics |= metrics
-            metrics_updated = True
+        metrics = None
+        eval_data = None
+        update_done = self.interval_batch_idx % self.cfg.opt.grad_accum_steps == 0
+        if not update_done:
+            return
+        if self.metrics_frequency and self.step_idx % self.metrics_frequency == 0 and self.device_env.is_primary():
+            metrics, eval_data = self.reading_metrics(sample)
 
-        if metrics_updated or self.step_idx % self.log_frequency == 0:
+        if metrics is not None or self.step_idx % self.log_frequency == 0:
             self.monitor.log_step(
                 'train',
                 step_idx=self.step_idx,
-                step_end_idx=self.num_intervals * self.num_steps_per_interval,
+                step_end_idx=self.total_steps,
                 interval=self.interval_idx,
                 loss=loss.item(),
                 lr=self.get_current_lr(),
-                metrics=self.train_metrics if metrics_updated else None,
-                eval_data=eval_gallery if metrics_updated else None,
+                metrics=metrics,
+                eval_data=eval_data,
             )
 
-    def get_ocr_metrics(self, sample):
-        """
-        In cruller_pretrain, this task returns some utils logs useful to monitor training.
-        Typically, we want to return a few samples of images  and their generated OCR so
-        that we can log them onto a tensorboard gallery in the log_step
-        """
-        metrics = {}
-        eval_data = {}
-        image_input, text_input, text_target = sample
-
-        image_input = image_input.to(self.device_env.device, non_blocking=True)
-        text_input = text_input[:, :-1].to(self.device_env.device, non_blocking=True)
-        text_target = text_target[:, 1:].to(self.device_env.device, non_blocking=True)
-
-        """
-        metrics = {}
-        image_input, text_input, text_target = sample
-        text_input = [item[0] for item in text_input]
-        text_input = torch.stack(text_input, dim=0).to(self.device_env.device, non_blocking=True)
-        text_target = [item[0] for item in text_target]
-        text_target = torch.stack(text_target, dim=0).to(self.device_env.device, non_blocking=True)
-        image_input = image_input.to(self.device_env.device, non_blocking=True)
-
-        # Add OCR-related metrics and generation
-
-        ocr_metrics, _ = get_ocr_metrics(
-            model=self.model,
-            tokenizer=self.tokenizer,
-            image_input=image_input,
-            text_input=text_target,
-            device_env=self.device_env,
-            max_recursion_length=self.max_recursion_length,
-        )"""
-
-        # Add OCR-related metrics and generation
-
-        ocr_metrics, ocr_reconstructed_sample = get_ocr_metrics(
-            model=self.model,
-            tokenizer=self.tokenizer,
-            image_input=image_input,
-            text_input=text_target,
-            device_env=self.device_env,
-            max_recursion_length=self.max_recursion_length,
-            prompt_token=self.task_start_token,
-        )
-        if ocr_metrics and ocr_reconstructed_sample:
-            metrics['ocr_reconstruction'] = ocr_metrics
-            eval_data['ocr_reconstruction_data'] = ocr_reconstructed_sample
-            print(ocr_metrics)
+    @torch.no_grad()
+    def reading_metrics(self, sample):
+        """ Greedy decode a few train samples and compute CER / WER vs the target text. """
+        n = self.cfg.num_metrics_samples
+        model = self.unwrapped_model
+        was_training = model.training
+        model.eval()
+        image_input = sample['image_input']
+        if isinstance(image_input, dict):
+            image_input = {k: v[:n] for k, v in image_input.items()}
         else:
-            _logger.info("Can't generate text from current batch. Skipping metrics...")
-        
-        # TODO Add other metrics relevant for eval step
-        # 
-        # metrics['metric_category'] = ... 
-        return metrics, eval_data
-
-    def __repr__(self):
-        outputs = [
-            f'model: {repr(self.model)}',
-            f'opt: {repr(self.optimizer)}',
-            f'sched: {repr(self.scheduler)}',
-        ]
-        return '\n'.join(outputs)
+            image_input = image_input[:n]
+        image_input = to_device(image_input, self.device_env.device)
+        prompt_ids = self.tokenizer.convert_tokens_to_ids([self.task_start_token])
+        with self.autocast():
+            generated = generate_greedy(
+                model,
+                image_input,
+                prompt_ids=[prompt_ids] * len(sample['text_input'][:n]),
+                stop_token_ids=[self.tokenizer.eos_token_id],
+                pad_token_id=self.pad_token_id,
+                max_new_tokens=self.cfg.metrics_max_new_tokens,
+            )
+        predictions = self.tokenizer.batch_decode(generated, skip_special_tokens=True)
+        targets = self.tokenizer.batch_decode(sample['text_input'][:n], skip_special_tokens=True)
+        # compare against the same # of target tokens that was decoded, avoid penalizing truncated decoding
+        targets_trunc = []
+        for t, g in zip(sample['text_input'][:n], generated):
+            t = t[t != self.pad_token_id][1:]  # remove start token
+            targets_trunc.append(self.tokenizer.decode(t[:max(len(g), 1)], skip_special_tokens=True))
+        if was_training:
+            model.train()
+        rates = text_error_rates(predictions, targets_trunc)
+        eval_data = {'prediction': predictions[0], 'target': targets[0]}
+        _logger.info(f'Sample prediction: {predictions[0][:300]!r}')
+        _logger.info(f'Sample target:     {targets[0][:300]!r}')
+        return {'train_cer': rates['cer'], 'train_wer': rates['wer']}, eval_data

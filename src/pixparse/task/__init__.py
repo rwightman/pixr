@@ -1,16 +1,5 @@
 from .task_cruller_pretrain import TaskCrullerPretrain, TaskCrullerPretrainCfg
-from .task_cruller_finetune_RVLCDIP import TaskCrullerFinetuneRVLCDIP, TaskCrullerFinetuneRVLCDIPCfg
-from .task_cruller_finetune_CORD import TaskCrullerFinetuneCORD, TaskCrullerFinetuneCORDCfg
-from .task_cruller_finetune_xent import (
-    TaskCrullerFinetuneXent,
-    TaskCrullerFinetuneXentCfg,
-)
-from .task_cruller_finetune_docvqa import TaskCrullerFinetuneDOCVQA, TaskCrullerFinetuneDOCVQACfg
-
-from .task_cruller_eval_ocr import TaskCrullerEvalOCR, TaskCrullerEvalOCRCfg
-from .task_donut_eval_ocr import TaskDonutEvalOCR, TaskDonutEvalOCRCfg
-from .task_cruller_eval_rvlcdip import TaskCrullerEvalRVLCDIP, TaskCrullerEvalRVLCDIPCfg
-from .task_cruller_eval_cord import TaskCrullerEvalCORD, TaskCrullerEvalCORDCfg
-from .task_cruller_eval_docvqa import TaskCrullerEvalDOCVQA, TaskCrullerEvalDOCVQACfg
-
-from .task_registry import get_train_task_from_cfg, get_train_task_cfgs, get_eval_task_from_cfg, get_eval_task_cfgs
+from .task_cruller_finetune_docvqa import TaskCrullerFinetuneDocVqa, TaskCrullerFinetuneDocVqaCfg
+from .task_cruller_eval_ocr import TaskCrullerEvalOcr, TaskCrullerEvalOcrCfg
+from .task_cruller_eval_docvqa import TaskCrullerEvalDocVqa, TaskCrullerEvalDocVqaCfg
+from .task_registry import get_train_task, get_train_task_cfgs, get_eval_task, get_eval_task_cfgs

@@ -1,0 +1,20 @@
+{
+    "type": "cruller",
+    "image_encoder": {
+        "name": "vit_base_patch16_clip_quickgelu_224.openai",
+        "image_fmt": "L",
+        "image_size": [
+            1280,
+            960
+        ],
+        "model_kwargs": {
+            "dynamic_img_size": false
+        }
+    },
+    "text_decoder": {
+        "name": "facebook/bart-base",
+        "pretrained": true,
+        "num_layers": 6,
+        "max_length": 1024
+    }
+}

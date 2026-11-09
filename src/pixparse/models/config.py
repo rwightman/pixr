@@ -1,11 +1,10 @@
 import copy
 import logging
-import re
-from pathlib import Path
 from dataclasses import dataclass, field, replace
-from typing import ClassVar, Optional, Union, Tuple
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
 
-from simple_parsing.helpers import Serializable
+from chug.common import Serializable
 
 from pixparse.utils.name_utils import _natural_key, clean_name
 
@@ -18,30 +17,56 @@ _logger = logging.getLogger(__name__)
 
 @dataclass
 class ImageEncoderCfg(Serializable):
+    """ timm image encoder config.
+
+    Supports NaFlexVit (native aspect / variable resolution, patch sequence input), and fixed size
+    timm models (ViT, hybrid ViT, convnets, etc), any model w/ NLC, NCHW, or NHWC feature output.
+    """
     name: str = 'vit_base_patch16_224'
-    timm_out_dim: Optional[int] = None  # set final head dim in timm (can use as alternative to external head)
-    pool_type: Optional[str] = None  # output pooling type
-    head_type: Optional[str] = None  # output head (projection) type ('linear', 'mlp')
-    out_dim: Optional[int] = None  # enforce different output dim for head (must be enabled)
-    patch_size: Optional[Union[int, Tuple[int, int]]] = None
-    window_size: Optional[Union[int, Tuple[int, int]]] = None
+    pretrained: bool = True
+    # Initialize from the pretrained weights of a different (but weight compatible) timm model. e.g. a fixed
+    # resolution CLIP ViT -> NaFlexVit w/ same block structure. Empty == use `name` pretrained weights.
+    pretrained_from: str = ''
+    model_kwargs: Dict[str, Any] = field(default_factory=dict)  # extra timm.create_model kwargs
+    head_type: Optional[str] = None  # output projection ('linear', 'mlp'), added automatically if dims differ
+    out_dim: Optional[int] = None  # override output projection dim (default == text decoder dim)
     image_fmt: str = 'L'
-    image_size: Optional[Tuple[int, int]] = (576, 448)
-    needs_image_size: bool = True  # model needs static image size on creation (vit, swin, etc)
+    image_size: Optional[Tuple[int, int]] = None  # (H, W) for fixed size models
+    max_seq_len: Optional[int] = None  # max patch sequence length for NaFlex models
+    image_mean: Optional[Tuple[float, ...]] = None  # override model pretrained cfg mean
+    image_std: Optional[Tuple[float, ...]] = None  # override model pretrained cfg std
     drop_rate: Optional[float] = None
     drop_path_rate: Optional[float] = None
     patch_drop_rate: Optional[float] = None
-    pretrained: bool = True
+
+    @property
+    def is_naflex(self) -> bool:
+        return self.name.startswith('naflexvit')
 
 
 @dataclass
 class TextDecoderCfg(Serializable):
+    """ Transformer (BART style, post-norm) text decoder config.
+
+    When `pretrained` is set, architecture hparams are taken from the Hugging Face model `name` and weights
+    are loaded from it. Otherwise the arch fields below define a randomly initialized decoder.
+    """
     name: str = 'facebook/bart-base'
     pretrained: bool = True
-    num_decoder_layers: Optional[int] = 4
-    max_length: Optional[int] = 1024
+    num_layers: Optional[int] = 4  # truncate (keep first N) pretrained layers, or set depth if not pretrained
+    max_length: int = 1024
     qk_norm_cross: bool = False
-    pad_token_id: Optional[int] = None  # FIXME move this to TokenizerCfg?
+    # Re-initialize cross-attention (w/ zero init output projection) instead of using pretrained (BART) weights.
+    # Pretrained cross-attn weights expect the pretrained text encoder's features and significantly slow learning
+    # w/ an image encoder, zero init output projections start the decoder as the pretrained LM.
+    reinit_cross_attn: bool = True
+    scale_embedding: Optional[bool] = None  # None == use pretrained config value (False for BART, True for mBART)
+    dim: int = 768
+    num_heads: int = 12
+    ffn_dim: int = 3072
+    dropout: float = 0.1
+    attn_dropout: float = 0.0
+    act_dropout: float = 0.0
 
 
 @dataclass
@@ -51,36 +76,61 @@ class ModelCfg(Serializable):
     text_decoder: TextDecoderCfg = field(default_factory=TextDecoderCfg)
 
 
-# FIXME I'm not super happy about the cfg / args arrangement. Improves some issues, creates others -rwightman
 @dataclass
 class ModelArgs:
+    """ Model selection + common overrides from the command line. """
     # specify a preset model configuration to load
-    name: str = ""
+    name: str = "cruller_base"
 
     # common overrides
     image_fmt: Optional[str] = None
     image_size: Optional[Tuple[int, int]] = None
+    max_seq_len: Optional[int] = None
     text_max_length: Optional[int] = None
+    text_num_layers: Optional[int] = None
+    drop_path_rate: Optional[float] = None
+    pretrained: Optional[bool] = None  # override pretrained (init from hub weights) for both towers
 
-    # final, loaded & merged config
-    cfg: ModelCfg = field(init=False)  # FIXME better to move this into task directly?
-
-    def __post_init__(self):
+    def resolve(self) -> ModelCfg:
+        """ Load the named model config and apply any overrides. """
         model_cfg = get_model_config(self.name)
         if model_cfg is None:
-            _logger.error(
-                f"Model config for {self.name} was not found."
-            )
-            raise RuntimeError(f"Model config for {self.name} was not found.")
+            raise RuntimeError(f"Model config for {self.name} was not found. Available: {list_models()}")
+        return self.apply_overrides(model_cfg)
 
+    def apply_overrides(self, model_cfg: ModelCfg, from_checkpoint: bool = False) -> ModelCfg:
+        """ Apply overrides to a model config.
+
+        Args:
+            model_cfg: base model config
+            from_checkpoint: weights will be loaded from a pixparse checkpoint, disable hub pretrained weights
+        """
+        enc_updates = {}
         if self.image_size is not None:
-            replace(model_cfg.image_encoder, image_size=self.image_size)
+            enc_updates['image_size'] = tuple(self.image_size)
         if self.image_fmt is not None:
-            replace(model_cfg.image_encoder, image_fmt=self.image_fmt)
+            enc_updates['image_fmt'] = self.image_fmt
+        if self.max_seq_len is not None:
+            enc_updates['max_seq_len'] = self.max_seq_len
+        if self.drop_path_rate is not None:
+            enc_updates['drop_path_rate'] = self.drop_path_rate
+        dec_updates = {}
         if self.text_max_length is not None:
-            replace(model_cfg.text_decoder, max_length=self.text_max_length)
+            dec_updates['max_length'] = self.text_max_length
+        if self.text_num_layers is not None:
+            dec_updates['num_layers'] = self.text_num_layers
+        if from_checkpoint:
+            enc_updates['pretrained'] = False
+            dec_updates['pretrained'] = False
+        elif self.pretrained is not None:
+            enc_updates['pretrained'] = self.pretrained
+            dec_updates['pretrained'] = self.pretrained
 
-        self.cfg = model_cfg
+        return replace(
+            model_cfg,
+            image_encoder=replace(model_cfg.image_encoder, **enc_updates),
+            text_decoder=replace(model_cfg.text_decoder, **dec_updates),
+        )
 
 
 def _scan_model_configs():

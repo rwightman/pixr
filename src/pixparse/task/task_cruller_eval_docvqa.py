@@ -1,232 +1,168 @@
+import json
 import logging
+import os
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
-from collections import OrderedDict
-from dataclasses import dataclass, field
-from functools import partial
-from typing import Optional
-
-import PIL
 import torch
-from torch import nn
-import torch.nn.functional as F
-from torchvision import transforms
-import numpy as np
 
-from pixparse.data import preprocess_ocr_anno, preprocess_text_anno, create_transforms
-from pixparse.data.loader import BaseCollate
-from pixparse.framework import (DeviceEnv, Monitor, TaskEval, TaskEvalCfg)
-from pixparse.models import Cruller, ModelCfg, get_model_config, ModelArgs, create_model
-from pixparse.tokenizers import TokenizerCfg, create_tokenizer
-from pixparse.utils.json_utils import json2token, token2json
-from pixparse.utils.json_utils import JSONParseEvaluator
-from pixparse.utils.metrics import average_normalized_levenshtein_similarity
+import chug
 
+from pixparse.data import create_image_preprocessor
+from pixparse.framework import DeviceEnv, Monitor, TaskEval, TaskEvalCfg
+from pixparse.generation import generate_greedy
+from pixparse.utils import anls_score
+from .common import init_model_and_tokenizer, image_feature_info, to_device
 
 _logger = logging.getLogger(__name__)
 
+DOCVQA_START_TOKEN = '<s_docvqa>'
+DOCVQA_TOKENS = [DOCVQA_START_TOKEN, '<s_question>', '</s_question>', '<s_answer>', '</s_answer>']
+
+
+def docvqa_task_cfg(
+        image_process_fn,
+        image_fmt: str,
+        text_process_fn=None,
+        is_training: bool = True,
+):
+    """ chug DocVQA pipeline cfg. Samples: '<s_question>{q}</s_question><s_answer>[{a}</s_answer>]'.
+
+    For eval (no text_process_fn / target) the text input is the prompt string up to '<s_answer>'.
+    """
+    return chug.DataTaskDocVqaCfg(
+        image_process_fn=image_process_fn,
+        text_process_fn=text_process_fn,
+        image_input_feat=image_feature_info(image_fmt),
+        text_target_feat=chug.FeatureInfo('text_target', input_key=None) if is_training else None,
+        error_handler='log_and_continue' if is_training else 'reraise_exception',
+    )
+
+
+class DocVqaEvaluator:
+    """ Greedy decode answers for DocVQA samples, accumulate predictions and ANLS. """
+
+    def __init__(self, tokenizer, device, autocast, max_new_tokens: int = 64):
+        self.tokenizer = tokenizer
+        self.device = device
+        self.autocast = autocast
+        self.max_new_tokens = max_new_tokens
+        self.stop_token_ids = [
+            tokenizer.convert_tokens_to_ids('</s_answer>'),
+            tokenizer.eos_token_id,
+        ]
+        self.results = []
+
+    def reset(self):
+        self.results = []
+
+    @torch.no_grad()
+    def step(self, model, batch):
+        image_input = to_device(batch['image_input'], self.device)
+        prompts = [DOCVQA_START_TOKEN + p for p in batch['text_input']]
+        prompt_ids = [self.tokenizer(p, add_special_tokens=False).input_ids for p in prompts]
+        with self.autocast():
+            generated = generate_greedy(
+                model,
+                image_input,
+                prompt_ids=prompt_ids,
+                stop_token_ids=self.stop_token_ids,
+                pad_token_id=self.tokenizer.pad_token_id,
+                max_new_tokens=self.max_new_tokens,
+            )
+        answers = [self.tokenizer.decode(g, skip_special_tokens=True).strip() for g in generated]
+        for answer, parse in zip(answers, batch['_parse']):
+            gt = parse.get('answers') or []
+            self.results.append({
+                'questionId': parse.get('question_id'),
+                'question': parse.get('question'),
+                'answer': answer,
+                'gt_answers': list(gt),
+                'anls': anls_score(answer, gt) if gt else None,
+            })
+
+    def gather(self, device_env: DeviceEnv):
+        if device_env.world_size > 1:
+            gathered = device_env.all_gather_object(self.results)
+            results = {}
+            for r in [r for rank_results in gathered for r in rank_results]:
+                results.setdefault(r['questionId'], r)  # de-dupe samples padded by the distributed sampler
+            self.results = list(results.values())
+        return self.results
+
+    def metrics(self) -> Dict[str, float]:
+        scored = [r['anls'] for r in self.results if r['anls'] is not None]
+        return {'anls': sum(scored) / max(len(scored), 1), 'num_samples': len(self.results)}
+
+
+def evaluate_docvqa(model, loader, evaluator: DocVqaEvaluator, device_env: DeviceEnv, log_frequency: int = 20):
+    was_training = model.training
+    model.eval()
+    evaluator.reset()
+    for batch_idx, batch in enumerate(loader):
+        evaluator.step(model, batch)
+        if log_frequency and batch_idx % log_frequency == 0:
+            _logger.info(f'DocVQA eval batch {batch_idx}/{getattr(loader, "num_batches", "?")}')
+    evaluator.gather(device_env)
+    if was_training:
+        model.train()
+    return evaluator.metrics()
 
 
 @dataclass
-class TaskCrullerEvalDOCVQACfg(TaskEvalCfg):
-    model: ModelArgs = field(default_factory=lambda: ModelArgs(
-        name='cruller_base',  # override model default in spec per task
-    ))
-
-    def __post_init__(self):
-        assert self.model.cfg is not None
-        if self.tokenizer is None:
-            # set tokenizer to text tower model name if not explicitly set
-            self.tokenizer = TokenizerCfg(name=self.model.cfg.text_decoder.name)
+class TaskCrullerEvalDocVqaCfg(TaskEvalCfg):
+    max_new_tokens: int = 64
 
 
-class TaskCrullerEvalDOCVQA(TaskEval):
-    """Simple task to evaluate donut on FUNSD data and get metrics in similar format as Cruller."""
+class TaskCrullerEvalDocVqa(TaskEval):
+    """ Evaluate a DocVQA fine-tuned checkpoint, ANLS on labelled splits + predictions json for submission. """
+    task_name = 'cruller_eval_docvqa'
 
     def __init__(
-        self,
-        cfg: TaskCrullerEvalDOCVQACfg,
-        checkpoint_path: str,
-        device_env: DeviceEnv,
-        monitor: Monitor = None,
+            self,
+            cfg: TaskCrullerEvalDocVqaCfg,
+            device_env: DeviceEnv,
+            monitor: Monitor = None,
+            checkpoint_path: str = '',
     ):
-        super().__init__(
-            cfg=cfg,
-            device_env=device_env,
-            monitor=monitor,
+        super().__init__(cfg=cfg, device_env=device_env, monitor=monitor)
+        assert checkpoint_path, 'A checkpoint is required for evaluation.'
+        self.model, self.tokenizer = init_model_and_tokenizer(
+            cfg.model,
+            cfg.tokenizer,
+            task_tokens=DOCVQA_TOKENS,
+            checkpoint_path=checkpoint_path,
         )
-        self.cfg = cfg
-        model_cfg = self.cfg.model.cfg
-        self.amp_dtype = None
-        if cfg.dtype is not None:
-            self.amp_dtype = (
-                torch.bfloat16 if cfg.dtype in ("bfloat16", "bf16") else torch.float16
-            )
-
-        self.task_start_token = "<s_docvqa>"
-        self.prompt_end_token = "<s_answer>"
-        self.max_position_embeddings = model_cfg.text_decoder.max_length
-        self.text_anno_fn = True  # set for image-text dataset experiments
-        self.tokenizer = create_tokenizer(cfg.tokenizer)
-
-        special_tokens_from_pretrain = [
-            "<sep/>",  # JSON list separator
-            "<s_pretrain>",  # task start (based on dataset/task)
-        ]
-        
-        num_pretrain_tokens = self.tokenizer.add_special_tokens(
-            {"additional_special_tokens": sorted(set(special_tokens_from_pretrain))}
+        self.input_info = self.model.image_encoder.input_info
+        self.image_preprocess_eval = create_image_preprocessor(
+            self.input_info,
+            is_training=False,
+            transform_type=cfg.image_transforms,
+        )
+        self.evaluator = DocVqaEvaluator(
+            self.tokenizer,
+            device=device_env.device,
+            autocast=self.autocast,
+            max_new_tokens=cfg.max_new_tokens,
         )
 
-        finetuning_special_tokens = [
-            self.task_start_token,  # task start (based on dataset/task)
-            self.prompt_end_token,  # prompt end (or task_start for pretrain)
-            "<s_question>",
-            "</s_question>",
-            "</s_answer>",
-        ]
-
-        num_finetuning_tokens = self.tokenizer.add_special_tokens(
-            {"additional_special_tokens": sorted(set(finetuning_special_tokens))}, replace_additional_special_tokens=False
-        )
-        
-                
-        self.model = create_model(
-            model_cfg,
-            pretrained=checkpoint_path, 
-            new_vocab_size=len(self.tokenizer)
-        )
-
-
-        preproc_fn = preprocess_text_anno if self.text_anno_fn else preprocess_ocr_anno
-        self.anno_preprocess_eval = partial(
-            preproc_fn,
-            tokenizer=self.tokenizer,
-            max_position_embeddings=self.max_position_embeddings,
-            task_start_token=self.task_start_token,
-            prompt_end_token=self.prompt_end_token,
-        )
-
-        self.has_no_sync = False
-
-        self.image_input_cfg = self.model.image_encoder.traits.get('input')
-        self.image_preprocess_eval = create_transforms(
-            self.cfg.image_transforms,
-            input_cfg=self.image_input_cfg,
-            training=False,
-            interpolation='bicubic',
-            crop_margin=False,  # True?
-            align_long_axis=False,
-        )
-        self.raw_predictions_test = dict()
+    def eval_data_cfg(self):
+        return docvqa_task_cfg(self.image_preprocess_eval, self.input_info['image_fmt'], is_training=False)
 
     def setup(self):
-        device = self.device_env.device
-        self.model.to(device)
+        self.model.to(self.device_env.device)
         self.model.eval()
-        self.all_ground_truths = []
-        self.all_predictions = []
-        self.acc_list = []
-
-        self.evaluator = JSONParseEvaluator()
-
-    def prepare_inputs_for_inference(
-        self,
-        input_ids: torch.Tensor,
-        encoder_outputs: torch.Tensor,
-        past_key_values=None,
-        past=None,
-        use_cache: bool = None,
-        attention_mask: torch.Tensor = None,
-    ):
-        if past is not None:
-            past_key_values = past
-        attention_mask = input_ids.ne(self.tokenizer.pad_token_id).long()
-        if past_key_values is not None:
-            input_ids = input_ids[:, -1:]
-        output = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "past_key_values": past_key_values,
-            "use_cache": use_cache,
-            "encoder_hidden_states": encoder_outputs,  # .last_hidden_state,
-        }
-        return output
-
-    def collate_fn(self, batch):
-        question_ids = []
-        image_ids = []
-        images = []
-        questions = []
-        answers = []
-        for item in batch:
-            question_ids.append(item['question_id'])
-            image_ids.append(item['image_id'])
-            images.append(item['image'])
-            questions.append(item['labels']["question"])
-            answers.append(item['labels']["answers"])
-        transform = self.image_preprocess_eval
-        images = torch.stack([transform(img) for img in images])
-        return {
-            "images": images,
-            "questions": questions,
-            "ground_truth_answers": answers,
-            "image_ids": image_ids,
-            "question_ids": question_ids,
-        }
 
     def step(self, batch):
-        """
-        Does one step of evaluation for DOCVQA. 
-        Current limitation: sample-by-sample decoding.
-        """
-        metrics = {}
-        image_outputs = self.model.image_encoder(batch['images'].to(self.device_env.device))
-        for output, question, answers, question_id in zip(image_outputs, batch['questions'], batch['ground_truth_answers'], batch['question_ids']):
-            self.all_ground_truths.append(answers)
-            with torch.inference_mode():
-                # split out answer from prompt
-                current_string = self.task_start_token + "<s_question>" + question + "</s_question>" + "<s_answer>" 
-                input_ids = torch.tensor(self.tokenizer.encode(current_string, add_special_tokens=False)).unsqueeze(0).to(self.device_env.device)  # Adding extra dimension for batch
-                max_steps = 512  # maximum number of steps
+        self.evaluator.step(self.model, batch)
 
-                for generation_step in range(max_steps):
-                    inputs = self.prepare_inputs_for_inference(input_ids=input_ids, encoder_outputs=output)
-                    decoder_outputs = self.model.text_decoder(**inputs)
-                    probabilities = F.softmax(decoder_outputs['logits'], dim=-1)
-                    next_token_id = torch.argmax(probabilities[0, -1]).item()  # Just get the last token for the single sample
-                    next_token = self.tokenizer.decode([next_token_id])
-                    current_string += next_token
-                    if next_token == "</s>":
-                        break
-                    input_ids = torch.tensor(self.tokenizer.encode(current_string, add_special_tokens=False)).unsqueeze(0).to(self.device_env.device)
-                predicted_json = token2json(current_string)
-            if 'answer' in predicted_json:
-                self.all_predictions.append(predicted_json['answer'])
-            else:
-                self.all_predictions.append("")
-        return metrics
+    def evaluate(self, loader):
+        return evaluate_docvqa(self.model, loader, self.evaluator, self.device_env)
 
-    def average_metrics(self, metrics: dict):
-        anls = average_normalized_levenshtein_similarity(ground_truth=self.all_ground_truths, predicted_answers=self.all_predictions)
-        return {"ANLS": anls}
-
-    def prepare_for_evaluation(
-        self, loaders
-    ):
-        loaders = {
-            loader_key: loader
-            for loader_key, loader in loaders.items()
-            if loader_key in ["eval", "eval_FUNSD"]
-        }
-
-        return loaders
-
-    def end(self):
-        # process metrics, average them out? now done in self.average_metrics, called in evaluate, maybe end() should be called in evaluate
-        # TODO do that, call average_metrics in end
-        pass
-
-    def state_dict(self):
-        state_dicts = {}
-        state_dicts["model"] = self.model.state_dict()
-        return state_dicts
+    def save_results(self, output_dir: str, name: str = 'docvqa'):
+        os.makedirs(output_dir, exist_ok=True)
+        with open(os.path.join(output_dir, f'{name}_results.json'), 'w') as f:
+            json.dump(self.evaluator.results, f, indent=1)
+        # DocVQA submission format
+        with open(os.path.join(output_dir, f'{name}_submission.json'), 'w') as f:
+            json.dump([{'questionId': r['questionId'], 'answer': r['answer']} for r in self.evaluator.results], f)

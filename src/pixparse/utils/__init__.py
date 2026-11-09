@@ -1,4 +1,3 @@
 from .file_utils import load_checkpoint, check_exists, get_latest_checkpoint, clean_state_dict
+from .metrics import anls_score, average_normalized_levenshtein_similarity, text_error_rates
 from .name_utils import clean_name, _natural_key
-from .ocr_utils import generate_ocr, get_generated_tokens, get_next_token, get_ocr_metrics
-from .args_utils import get_selected_non_default_args

@@ -169,18 +169,20 @@ class Monitor:
             interval: Optional[int] = None,
             loss: Optional[float] = None,
             rate: Optional[Union[float, Tuple[float, float]]] = None,
-            learning_rate: Optional[float] = None,
+            lr: Optional[float] = None,
             phase_suffix: str = '',
-            metrics: dict = None,
-            eval_data: dict = None,
+            metrics: Optional[Dict[str, float]] = None,
+            eval_data: Optional[Dict[str, str]] = None,
             **kwargs,
     ):
         """ log train/eval step
+
+        Args:
+            metrics: flat dict of scalar metrics (logged to all destinations)
+            eval_data: dict of text samples (e.g. predicted vs target text), logged to tensorboard if enabled
         """
         if not self.output_enabled:
             return
-        if 'num_steps' in kwargs:
-            step_end_idx = max(0, kwargs.pop('num_steps') - 1)
         phase_title = f'{phase.capitalize()} ({phase_suffix})' if phase_suffix else f'{phase.capitalize()}:'
         progress = 100. * step_idx / step_end_idx if step_end_idx else 0.
         rate_str = ''
@@ -195,57 +197,32 @@ class Monitor:
             f'[{step_idx}/{step_end_idx} ({progress:>3.0f}%)]' if step_end_idx is not None else None,
             rate_str,
             f'loss: {loss:.5f}' if loss is not None else None,
-            f'lr: {learning_rate:.5f}' if learning_rate is not None else None,
+            f'lr: {lr:.3e}' if lr is not None else None,
         ]
         _add_kwargs(text_update, **kwargs)
+        if metrics:
+            _add_kwargs(text_update, **metrics)
         log_str = ' '.join(item for item in text_update if item)
         self.logger.info(log_str)
 
-        if self.tensorboard is not None:
-            if metrics is not None:
-                for metric_category, metric_items in metrics.items():
-                    for metric_name, metric_value in metric_items.items():
-                        self.tensorboard.add_scalar(
-                            '/'.join([metric_category, metric_name, phase_title]),
-                            metric_value,
-                            step_idx,
-                        )
-            if (eval_data is not None) and self.log_eval_data:
-                for eval_data_category, eval_data_triplet in eval_data.items():
-                    if eval_data_category == 'ocr_reconstruction_data':
-                        # Add an image, its text, and its reconstructed text
-                        # revert of https://github.com/huggingface/open-muse/blob/d30d864b2f17fd0b152037e10b73aeb2b1941e20/training/train_muse.py#L757
-                        image_tag = '/'.join([eval_data_category, 'image', phase_title])
-                        # Hack to avoid caffe2 import errors in tensorboard
-                        # This avoids checking for image names
-                        self.tensorboard._get_file_writer().add_summary(
-                            image(image_tag, eval_data_triplet['image'], dataformats="CHW"),
-                            step_idx,
-                        )
-                        self.tensorboard.add_text(
-                            '/'.join([eval_data_category, 'original_text', phase_title]),
-                            eval_data_triplet['original_text'],
-                            step_idx,
-                        )
-                        self.tensorboard.add_text(
-                            '/'.join([eval_data_category, 'reconstructed_text', phase_title]),
-                            eval_data_triplet['reconstructed_text'],
-                            step_idx,
-                        )
+        scalars = dict(kwargs)
+        if loss is not None:
+            scalars['loss'] = loss
+        if lr is not None:
+            scalars['lr'] = lr
+        if metrics:
+            scalars.update(metrics)
+        scalars = {k: v for k, v in scalars.items() if isinstance(v, (int, float))}
 
-            if loss is not None:
-                self.tensorboard.add_scalar('/'.join(['Loss', phase_title]), loss, step_idx)
-            if learning_rate is not None:
-                self.tensorboard.add_scalar('/'.join(['Learning Rate', phase_title]), loss, step_idx)
-            for k, v in kwargs.items():
-                self.tensorboard.add_scalar('/'.join([k, phase_title]), v, step_idx)
+        if self.tensorboard is not None:
+            for k, v in scalars.items():
+                self.tensorboard.add_scalar(f'{phase}/{k}', v, step_idx)
+            if eval_data and self.log_eval_data:
+                for k, v in eval_data.items():
+                    self.tensorboard.add_text(f'{phase}/{k}', str(v), step_idx)
 
         if self.wandb is not None:
-            wandb_log = dict(**kwargs)
-            if loss:
-                wandb_log['loss'] = loss
-            if learning_rate:
-                wandb_log['learning_rate'] = learning_rate
+            wandb.log({f'{phase}/{k}': v for k, v in scalars.items()}, step=step_idx)
 
     def log_phase(
             self,

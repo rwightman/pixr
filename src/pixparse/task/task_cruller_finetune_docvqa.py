@@ -1,236 +1,110 @@
 import logging
-from ast import literal_eval
-from collections import OrderedDict
-from dataclasses import dataclass, field
-from functools import partial
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Dict
 
-import numpy as np
-import timm
-import timm.utils
-import torch
-import torch.nn as nn
-import torchvision.transforms as transforms
-from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-from timm.layers import SelectAdaptivePool2d
+import torch.nn.functional as F
 
-from pixparse.data import preprocess_ocr_anno, preprocess_text_anno, create_transforms
-from pixparse.data.loader import BaseCollate
+import chug
+
+from pixparse.data import create_image_preprocessor
 from pixparse.framework import DeviceEnv, Monitor, TaskTrain, TaskTrainCfg
-from pixparse.models import Cruller, create_model, resize_model_embeddings, ModelArgs
-from pixparse.tokenizers import TokenizerCfg, create_tokenizer
-from pixparse.utils.json_utils import json2token, token2json, JSONParseEvaluator  # assuming you need all three
-from pixparse.utils import load_checkpoint, get_latest_checkpoint
+from .common import init_model_and_tokenizer, checkpoint_extra_state, to_device, trim_padding
+from .task_cruller_eval_docvqa import DOCVQA_START_TOKEN, DOCVQA_TOKENS, DocVqaEvaluator, docvqa_task_cfg, \
+    evaluate_docvqa
 
 _logger = logging.getLogger(__name__)
 
 
-class CollateDocVQA(BaseCollate):
-    r"""
-    A collator for handling batches of PIL images and corresponding labels
-    as utilized with the SinglePageDocVQA dataset.
-    Strings returned will be <s_docvqa><s><question>...question...?</s_question><s_answer>...answer.<s_answer></s>
-    Args:
-        tokenizer (`Callable`):
-            Tokenizer function to convert textual labels into tokens.
-        image_preprocess (`Callable`):
-            method to perform preprocessing operations on images.
-        start_token (`str`):
-            A token that indicates the start of a sequence from the current task. <s_rvlcdip> for RVLCDIP, etc.
-        max_length (`int`):
-            Maximum length allowed for tokenized text sequences.
-    """
-
-    def __init__(
-        self,
-        tokenizer,
-        image_preprocess,
-        start_token,
-        max_length: int,
-        end_token,
-    ):
-        super().__init__(
-            tokenizer, image_preprocess, start_token, max_length=max_length
-        )
-        self.end_token = end_token
-
-    def __call__(self, batch):
-        images = [item["image"] for item in batch]
-        # question/answer tokens are already present in the data
-        q_and_as = [np.random.choice(item['labels']) for item in batch]  # TODO allow to change strategy here
-        labels_tokens = []
-        for text in q_and_as:
-            labels_tokens.append(self.tokenizer_fn(self.start_token + text + self.tokenizer.eos_token))
-        return self.pack_inputs(images, labels_tokens)
-
-
 @dataclass
-class TaskCrullerFinetuneDOCVQACfg(TaskTrainCfg):
-    # TODO do we want to pass here all parameters defined before?
-    model: ModelArgs = field(default_factory=lambda: ModelArgs(
-        name='cruller_base', text_max_length=1024  # override model default in spec per task
-    ))
-
-    def __post_init__(self):
-        assert self.model.cfg is not None
-        if self.tokenizer is None:
-            # set tokenizer to text tower model name if not explicitly set
-            self.tokenizer = TokenizerCfg(name=self.model.cfg.text_decoder.name)
+class TaskCrullerFinetuneDocVqaCfg(TaskTrainCfg):
+    text_max_length: int = 128
+    eval_max_new_tokens: int = 64
 
 
-class TaskCrullerFinetuneDOCVQA(TaskTrain):
+class TaskCrullerFinetuneDocVqa(TaskTrain):
+    """ DocVQA fine-tuning, Donut style prompt / answer format.
+
+    '<s_docvqa><s_question>{question}</s_question><s_answer>{answer}</s_answer></s>'
+    Loss is only applied to the answer tokens (after '<s_answer>').
+    """
+    task_name = 'cruller_finetune_docvqa'
+    task_start_token = DOCVQA_START_TOKEN
+    prompt_end_token = '<s_answer>'
+
     def __init__(
-        self,
-        cfg: TaskCrullerFinetuneDOCVQACfg,
-        device_env: DeviceEnv,
-        monitor: Monitor = None,
-        checkpoint_path: str = "",
+            self,
+            cfg: TaskCrullerFinetuneDocVqaCfg,
+            device_env: DeviceEnv,
+            monitor: Monitor = None,
+            checkpoint_path: str = '',
     ):
         super().__init__(
             cfg=cfg,
             device_env=device_env,
             monitor=monitor,
         )
-        self.cfg = cfg
-        model_cfg = self.cfg.model.cfg
-        # NOTE dtype is currently being used as 'amp dtype' only, ie the low precision type, we may want to
-        #  differentiate different precision modes such as amp + dtype, pure float16/bfloat16, custom mixed prec, etc
-        self.amp_dtype = None
-        if cfg.dtype is not None:
-            self.amp_dtype = (torch.bfloat16 if cfg.dtype in ("bfloat16", "bf16") else torch.float16)
-
-        self.task_start_token = "<s_docvqa>"
-        self.prompt_end_token = "<s_answer>"  # Slice prompt right before answer content
-        self.max_position_embeddings = model_cfg.text_decoder.max_length
-        self.text_anno_fn = True  # set for image-text dataset experiments
-        self.tokenizer = create_tokenizer(cfg.tokenizer)
-
-        # Setup task specific tokens NOTE: Donut appears to add tokens on the fly during dataset init, requires
-        # iterating through full dataset on train start due to not being able to update once tokenizers passed through
-        # to dataloader processes, we should store this all in configs up front
-        preproc_fn = preprocess_text_anno if self.text_anno_fn else preprocess_ocr_anno
-
-        special_tokens_from_pretrain = [
-            "<sep/>",  # JSON list separator
-            "<s_pretrain>",  # task start (based on dataset/task)
-        ]
-        
-        num_pretrain_tokens = self.tokenizer.add_special_tokens(
-            {"additional_special_tokens": sorted(set(special_tokens_from_pretrain))}
+        self.model, self.tokenizer = init_model_and_tokenizer(
+            cfg.model,
+            cfg.tokenizer,
+            task_tokens=DOCVQA_TOKENS,
+            checkpoint_path=checkpoint_path,
         )
-        self.model = create_model(
-            model_cfg,
-            pretrained=checkpoint_path, 
-            new_vocab_size=len(self.tokenizer)
-        )
+        self.pad_token_id = self.tokenizer.pad_token_id
+        self.input_info = self.model.image_encoder.input_info
 
-        finetuning_special_tokens = [
-            self.task_start_token,  # task start (based on dataset/task)
-            self.prompt_end_token,  # prompt end (or task_start for pretrain)
-            "<s_question>",
-            "</s_question>",
-            "</s_answer>",
-        ]
-
-        num_finetuning_tokens = self.tokenizer.add_special_tokens(
-            {"additional_special_tokens": sorted(set(finetuning_special_tokens))}, replace_additional_special_tokens=False
-        )
-        if num_finetuning_tokens > 0:
-            resize_model_embeddings(self.model, new_vocab_size=len(self.tokenizer))
-
-        self.loss = nn.CrossEntropyLoss(ignore_index=-100)
-        self.has_no_sync = False
-        # preprocessors cross both the task/model & dataset domain, created within task here and passed to data loaders
-
-        self.anno_preprocess_train = partial(
-            preproc_fn,
-            tokenizer=self.tokenizer,
-            max_position_embeddings=self.max_position_embeddings,
+        self.text_preprocess_train = chug.create_text_preprocessor(
+            self.tokenizer,
+            max_length=cfg.text_max_length,
             task_start_token=self.task_start_token,
             prompt_end_token=self.prompt_end_token,
         )
-
-        self.image_input_cfg = self.model.image_encoder.traits.get('input')
-        self.image_preprocess_train = create_transforms(
-            self.cfg.image_transforms,
-            input_cfg=self.image_input_cfg,
-            training=True,
-            interpolation='bicubic',
-            crop_margin=False,  # True?
-            align_long_axis=True,
+        self.image_preprocess_train = create_image_preprocessor(
+            self.input_info,
+            is_training=True,
+            transform_type=cfg.image_transforms,
         )
-
-        self.collator = CollateDocVQA(
+        self.image_preprocess_eval = create_image_preprocessor(
+            self.input_info,
+            is_training=False,
+            transform_type=cfg.image_transforms,
+        )
+        self.evaluator = DocVqaEvaluator(
             self.tokenizer,
-            self.image_preprocess_train,
-            self.task_start_token,
-            end_token=self.prompt_end_token,
-            max_length=128  # FIXME derive from config
+            device=device_env.device,
+            autocast=self.autocast,
+            max_new_tokens=cfg.eval_max_new_tokens,
         )
 
-    def setup(self, num_batches_per_interval: int, resume: str):
-        """
-        Overrides the setup method to add additional setup steps specific to TaskCrullerFinetuneDOCVQA.
-        The additional setup step is adding finetuning tokens.
+    def train_data_cfg(self):
+        return docvqa_task_cfg(
+            self.image_preprocess_train,
+            self.input_info['image_fmt'],
+            text_process_fn=self.text_preprocess_train,
+            is_training=True,
+        )
 
-        Args:
-            num_batches_per_interval: Number of batches per interval.
-            resume: Flag indicating whether to resume from a checkpoint.
-        """
-        if resume:
-            if resume == "latest":
-                resume = get_latest_checkpoint(resume)
-            state_dict = load_checkpoint(resume)
-            self.load_state_dict(state_dict)
+    def eval_data_cfg(self):
+        return docvqa_task_cfg(self.image_preprocess_eval, self.input_info['image_fmt'], is_training=False)
 
-        self.model.text_decoder.trunk.model.decoder.embed_tokens.padding_idx = self.tokenizer.pad_token_id
-
-        super().setup(num_batches_per_interval=num_batches_per_interval, resume=resume)
-
-    def collate_fn(self, batch):
-        return self.collator(batch)
+    def extra_state(self) -> Dict[str, Any]:
+        return checkpoint_extra_state(self.unwrapped_model, self.tokenizer, self.task_name)
 
     def _forward(self, sample: Dict[str, Any]):
-        image_input = sample["image"]
-        label = sample["label"]
-        text_target = sample["text_target"]
-        image_input = image_input.to(self.device_env.device, non_blocking=True)
-        label = label.to(self.device_env.device, non_blocking=True)
-        text_target = text_target.to(self.device_env.device, non_blocking=True)
+        device = self.device_env.device
+        image_input = to_device(sample['image_input'], device)
+        text_input, text_target = trim_padding(sample['text_input'], sample['text_target'], self.pad_token_id)
+        text_input = text_input[:, :-1].to(device, non_blocking=True)
+        text_target = text_target[:, 1:].to(device, non_blocking=True)
 
         with self.autocast():
-            output = self.model(image_input, label)
-            logits = output["logits"]
-            loss = self.loss(
-                logits.view(-1, len(self.tokenizer)),
-                text_target.view(-1),
+            logits = self.model(image_input, text_input)
+            loss = F.cross_entropy(
+                logits.flatten(0, 1),
+                text_target.flatten(),
+                ignore_index=-100,
+                label_smoothing=self.cfg.opt.label_smoothing,
             )
-        return output, loss
+        return logits, loss
 
-    def after_step(self, sample, output, loss):
-        metrics_updated = False
-        if self.step_idx % self.metrics_frequency == 0:
-            # TODO add metrics and possibly eval_gallery for finetuning
-            self.train_metrics = None
-            eval_gallery = None
-            metrics_updated = True
-
-        if metrics_updated or self.step_idx % self.log_frequency == 0:
-            self.monitor.log_step(
-                'train',
-                step_idx=self.step_idx,
-                step_end_idx=self.num_intervals * self.num_steps_per_interval,
-                interval=self.interval_idx,
-                loss=loss.item(),
-                lr=self.get_current_lr(),
-                metrics=self.train_metrics if metrics_updated else None,
-                eval_data=eval_gallery if metrics_updated else None,
-            )
-
-    def __repr__(self):
-        outputs = [
-            f'model: {repr(self.model)}',
-            f'opt: {repr(self.optimizer)}',
-            f'sched: {repr(self.scheduler)}',
-        ]
-        return '\n'.join(outputs)
+    def evaluate(self, loader):
+        return evaluate_docvqa(self.unwrapped_model, loader, self.evaluator, self.device_env)

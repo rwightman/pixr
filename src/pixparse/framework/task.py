@@ -1,26 +1,31 @@
 import abc
 import logging
+import math
 from contextlib import nullcontext
-from dataclasses import dataclass
 from functools import partial
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
-import torch.nn.functional as F
 
-import timm
 import timm.utils
 from timm.optim import create_optimizer_v2
 from timm.scheduler import create_scheduler_v2
 
-from pixparse.utils import load_checkpoint, clean_state_dict
-from .config import TaskTrainCfg, TaskEvalCfg
+from pixparse.utils import clean_state_dict
+from .config import TaskTrainCfg, TaskEvalCfg, TaskCfg
 from .device import DeviceEnv
-from .fsdp import fsdp_wrap_model
 from .monitor import Monitor
 
 
 _logger = logging.getLogger(__name__)
+
+
+def _amp_dtype(cfg: TaskCfg):
+    if not cfg.amp:
+        return None
+    if cfg.dtype in ('float16', 'fp16', 'half'):
+        return torch.float16
+    return torch.bfloat16
 
 
 class Task(abc.ABC):
@@ -40,7 +45,7 @@ class Task(abc.ABC):
         pass
 
 
-class TaskEval(Task):  
+class TaskEval(Task):
     def __init__(
             self,
             cfg: TaskEvalCfg,
@@ -48,18 +53,36 @@ class TaskEval(Task):
             monitor: Monitor = None,
     ):
         super().__init__(device_env=device_env, monitor=monitor)
-    
-    def collate_fn(self, batch):
-        pass
+        self.cfg = cfg
+        self.amp_dtype = _amp_dtype(cfg)
+
+    def autocast(self):
+        if self.amp_dtype is None:
+            return nullcontext()
+        return torch.autocast(device_type=self.device_env.device.type, dtype=self.amp_dtype)
 
     def setup(self, *args, **kwargs):
         pass
 
-    def prepare_for_evaluation(self):
-        pass
 
-    def end(self):
-        pass
+def param_groups_encoder_decoder(model, weight_decay: float, encoder_lr_scale: float = 1.0):
+    """ Param groups w/ no weight decay for norm, bias, embedding params, and optional encoder LR scaling. """
+    no_wd = set(model.no_weight_decay()) if hasattr(model, 'no_weight_decay') else set()
+    groups = {}
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        is_encoder = name.startswith('image_encoder.')
+        decay = not (param.ndim <= 1 or name.endswith('.bias') or name in no_wd)
+        key = (is_encoder, decay)
+        if key not in groups:
+            groups[key] = {
+                'params': [],
+                'weight_decay': weight_decay if decay else 0.,
+                'lr_scale': encoder_lr_scale if is_encoder else 1.0,
+            }
+        groups[key]['params'].append(param)
+    return list(groups.values())
 
 
 class TaskTrain(Task):
@@ -86,25 +109,27 @@ class TaskTrain(Task):
         self.interval_batch_idx = 0  # batch within current interval
 
         self.model = None
-        # NOTE dtype is currently being used as 'amp dtype' only, ie the low precision type,
-        #  we may want to differentiate different precision modes such as
-        #  amp + dtype, pure float16/bfloat16, custom mixed prec, etc
-        self.amp_dtype = None
-        if cfg.amp:
-            if cfg.dtype is not None and cfg.dtype in ('bfloat16', 'bf16'):
-                self.amp_dtype = torch.bfloat16
-            else:
-                self.amp_dtype = torch.float16
+        self.amp_dtype = _amp_dtype(cfg)
         self.has_no_sync = False
 
         # optimization state initialized in setup()
         self.optimizer = None
         self.scheduler = None
         self.scaler = None
-        self.autocast = None
 
-    def collate_fn(self, batch):
-        pass
+    def autocast(self):
+        if self.amp_dtype is None:
+            return nullcontext()
+        return torch.autocast(device_type=self.device_env.device.type, dtype=self.amp_dtype)
+
+    @property
+    def unwrapped_model(self):
+        model = self.model
+        if hasattr(model, 'module'):
+            model = model.module
+        if hasattr(model, '_orig_mod'):
+            model = model._orig_mod
+        return model
 
     def setup(
             self,
@@ -112,124 +137,93 @@ class TaskTrain(Task):
             resume: Optional[str] = "",
     ):
         """
-        FIXME this interface needs refinement
-        * currently, training duration is 'interval' based, where interval is either full dataset epoch, or
-            sampled with replacement periods, intervals correspond to checkpoint / eval periods
-        * LR schedule is updated per-step, so num_steps_per_interval is required to translate intervals ->
-            total steps for scheduling
-        * future should allow for step based durations (keeping interval as option), where train and warmup
-            durations are specified in steps, checkpoint intervals in steps or time
+        Training duration is 'interval' based. An interval is a full dataset epoch, or a fixed # of samples
+        for large (resampled / streamed) datasets. LR is updated per optimizer step, num_batches_per_interval
+        is required from the data pipeline to translate intervals -> steps.
 
         Args:
             num_batches_per_interval: pass info from data pipeline for LR scheduling
-            resume: # TODO should be a union of bool and str, selecting most recent checkpoint or the one wanted by user
-        Returns:
-
+            resume: path of checkpoint to resume training (model + optimizer + schedule state) from
         """
-        self._setup_model()
-
-        if self.cfg.dist.dist_mode == 'fsdp':
-            # FSDP makes the setup more complicated than DDP, need to shard first
-            # Wrapper based changes such as .module, _fsdp_wrapped_module. and param name
-            # changes need to be considered?
-            # TODO Checkpoint saving needs FSDP support
-            if self.device_env.world_size > 1:
-                self._distribute_model()
-
-            self._setup_optimization(
-                num_batches_per_interval=num_batches_per_interval,
-            )
-
-            # TODO support resume
-            assert not resume
-        else:
-            # DDP or no parallelization
-            self._setup_optimization(
-                num_batches_per_interval=num_batches_per_interval,
-            )
-
-            if resume:
-                state_dict = load_checkpoint(resume)
-                self.load_state_dict(state_dict, restore_optimizer_state=True, restore_scheduler_state=True)
-
-            if self.device_env.world_size > 1:
-                self._distribute_model()
-
-    def _setup_model(self):
-        # FIXME currently thinking moving to device, setup DDP / FSDP makes sense
-        # in setup here vs in __init__()
         self.model.to(self.device_env.device)
-
         if self.cfg.opt.grad_checkpointing:
             self.model.set_grad_checkpointing()
 
-    def _distribute_model(self):
-        # NOTE: the plan is to add option for FSDP w/ HYBRID_SHARD strategy to extend
-        # model size capacity beyond DDP w/o overloading HF cluster NCCL throughput.
-        if self.cfg.dist.dist_mode == 'fsdp':
-            self.model = fsdp_wrap_model(
-                self.model,
-                layers=self.model.get_wrap_layers(),
-                device=self.device_env.device,
-                sharding_strategy=self.cfg.dist.sharding_strategy,
-                mixed_precision_dtype=self.amp_dtype,
-            )
-        else:
+        self._setup_optimization(num_batches_per_interval=num_batches_per_interval)
+
+        if resume:
+            from pixparse.utils import load_checkpoint
+            state_dict = load_checkpoint(resume)
+            self.load_state_dict(state_dict, restore_optimizer_state=True, restore_scheduler_state=True)
+            _logger.info(f'Resumed from {resume} at interval {self.interval_idx}, step {self.step_idx}.')
+
+        if self.device_env.world_size > 1:
             self.model = torch.nn.parallel.DistributedDataParallel(
                 self.model,
                 device_ids=[self.device_env.device],
-                static_graph=True,
             )
-            self.has_no_sync = hasattr(self.model, 'no_sync')
+            self.has_no_sync = True
+
+        if self.cfg.compile:
+            self.model = torch.compile(self.model)
 
     def _setup_optimization(self, num_batches_per_interval):
-        device = self.device_env.device
+        opt_cfg = self.cfg.opt
         opt_kwargs = {}
-        if self.cfg.opt.betas is not None:
-            opt_kwargs["betas"] = self.cfg.opt.betas
-        if self.cfg.opt.momentum is not None:
-            opt_kwargs["momentum"] = self.cfg.opt.momentum
+        if opt_cfg.betas is not None:
+            opt_kwargs["betas"] = tuple(opt_cfg.betas)
+        if opt_cfg.momentum is not None:
+            opt_kwargs["momentum"] = opt_cfg.momentum
+        if opt_cfg.layer_decay is not None:
+            params = self.model
+            opt_kwargs['layer_decay'] = opt_cfg.layer_decay
+        else:
+            params = param_groups_encoder_decoder(
+                self.model,
+                weight_decay=opt_cfg.weight_decay,
+                encoder_lr_scale=opt_cfg.encoder_lr_scale,
+            )
         self.optimizer = create_optimizer_v2(
-            self.model,
-            self.cfg.opt.optimizer,
-            lr=self.cfg.opt.learning_rate,
-            eps=self.cfg.opt.eps,
-            layer_decay=self.cfg.opt.layer_decay,
-            weight_decay=self.cfg.opt.weight_decay,
+            params,
+            opt_cfg.optimizer,
+            lr=opt_cfg.learning_rate,
+            eps=opt_cfg.eps,
+            weight_decay=opt_cfg.weight_decay,
             **opt_kwargs,
         )
 
-        if self.cfg.amp:
+        if self.amp_dtype == torch.float16:
             self.scaler = timm.utils.NativeScaler()
-            self.autocast = partial(
-                torch.autocast, device_type=device.type, dtype=self.amp_dtype
-            )
         else:
             self.scaler = None
-            self.autocast = nullcontext
 
-        # FIXME will need two paths here to support interval vs step based durations
-        #  in either case LR is always stepped with each optimizer update (train step)
-        self.num_steps_per_interval = num_batches_per_interval // self.cfg.opt.grad_accum_steps
-        self.scheduler, num_scheduled_epochs = create_scheduler_v2(
+        self.num_steps_per_interval = num_batches_per_interval // opt_cfg.grad_accum_steps
+        total_steps = self.num_intervals * self.num_steps_per_interval
+        warmup_steps = int(self.num_warmup_intervals * self.num_steps_per_interval)
+        # schedule in steps (updates_per_epoch=1) so fractional warmup intervals are supported
+        self.scheduler, _ = create_scheduler_v2(
             self.optimizer,
-            self.cfg.opt.scheduler,
-            warmup_lr=self.cfg.opt.warmup_learning_rate,
-            warmup_epochs=self.num_warmup_intervals,
-            num_epochs=self.num_intervals,
-            step_on_epochs=False,  # sched is stepped on updates
-            updates_per_epoch=self.num_steps_per_interval,
+            opt_cfg.scheduler,
+            min_lr=opt_cfg.min_learning_rate,
+            warmup_lr=opt_cfg.warmup_learning_rate,
+            warmup_epochs=warmup_steps,
+            num_epochs=total_steps,
+            cooldown_epochs=0,
+            step_on_epochs=False,
+            updates_per_epoch=1,
         )
-        self.scheduler.step_update(0)
+        self.scheduler.step_update(self.step_idx)
+
+    @property
+    def total_steps(self):
+        return self.num_intervals * self.num_steps_per_interval
 
     def interval_start(self):
-        # epoch / interval start hook, useful?
         self.model.train()
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
         self.interval_batch_idx = 0
 
     def interval_end(self):
-        # epoch / interval end hook, useful?
         self.monitor.log_phase('train', self.interval_idx)
         self.interval_idx += 1
 
@@ -241,19 +235,13 @@ class TaskTrain(Task):
     def _update(self, sample: Dict[str, Any]):
         accum_steps = self.cfg.opt.grad_accum_steps
         need_update = (self.interval_batch_idx + 1) % accum_steps == 0
-        if self.has_no_sync and not need_update:
-            with self.model.no_sync():
-                output, loss = self._forward(sample)
-                train_loss = self._loss(loss)
-                if accum_steps > 1:
-                    train_loss /= accum_steps
-                self._backward(train_loss, need_update=False)
-        else:
+        sync_ctx = self.model.no_sync if (self.has_no_sync and not need_update) else nullcontext
+        with sync_ctx():
             output, loss = self._forward(sample)
             train_loss = self._loss(loss)
             if accum_steps > 1:
-                train_loss /= accum_steps
-            self._backward(train_loss)
+                train_loss = train_loss / accum_steps
+            self._backward(train_loss, need_update=need_update)
         return output, loss, need_update
 
     def _after_update(self, updated=True):
@@ -263,7 +251,7 @@ class TaskTrain(Task):
             return
         self.step_idx += 1
         self.scheduler.step_update(self.step_idx)
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
 
     @abc.abstractmethod
     def _forward(self, sample: Dict[str, Any]):
@@ -301,16 +289,6 @@ class TaskTrain(Task):
             return loss['loss']
         return loss
 
-    def _log_step(self, output, loss):
-        self.monitor.log_step(
-            'train',
-            step_idx=self.step_idx,
-            step_end_idx=self.num_intervals * self.num_steps_per_interval,
-            interval=self.interval_idx,
-            loss=self._loss(loss).item(),
-            lr=self.get_current_lr(),
-        )
-
     def after_step(self, sample, output, loss):
         """ operations to perform after step
         Anything that
@@ -318,17 +296,27 @@ class TaskTrain(Task):
           * needs to execute code that is not torch.compile() safe
           * perform logging / io, etc
         """
-        if self.step_idx % self.log_frequency == 0:
-            self._log_step(output, loss)
+        if self.step_idx % self.log_frequency == 0 and self.interval_batch_idx % self.cfg.opt.grad_accum_steps == 0:
+            self.monitor.log_step(
+                'train',
+                step_idx=self.step_idx,
+                step_end_idx=self.total_steps,
+                interval=self.interval_idx,
+                loss=self._loss(loss).item(),
+                lr=self.get_current_lr(),
+            )
 
     def get_current_lr(self):
         lrl = [param_group['lr'] for param_group in self.optimizer.param_groups]
-        lr = sum(lrl) / len(lrl)
-        return lr
+        return max(lrl)
+
+    def extra_state(self) -> Dict[str, Any]:
+        """ Extra (non-tensor) state to store in checkpoints, e.g. model config, tokenizer tokens. """
+        return {}
 
     def state_dict(self):
         state_dicts = {}
-        state_dicts['model'] = self.model.state_dict()
+        state_dicts['model'] = self.unwrapped_model.state_dict()
         state_dicts['optimizer'] = self.optimizer.state_dict()
         if hasattr(self.scheduler, 'state_dict'):
             state_dicts['scheduler'] = self.scheduler.state_dict()
@@ -337,6 +325,7 @@ class TaskTrain(Task):
         state_dicts['step_idx'] = self.step_idx
         state_dicts['batch_idx'] = self.batch_idx
         state_dicts['interval_idx'] = self.interval_idx
+        state_dicts.update(self.extra_state())
         return state_dicts
 
     def load_state_dict(
@@ -347,10 +336,8 @@ class TaskTrain(Task):
             restore_scheduler_state=True,
     ):
         # assume state_dict contains only model if key not present
-        state_dict_model = state_dict.get('model', state_dict)
-        if not hasattr(self.model, 'module'):
-            state_dict_model = clean_state_dict(state_dict_model)
-        self.model.load_state_dict(state_dict_model)
+        state_dict_model = clean_state_dict(state_dict.get('model', state_dict))
+        self.unwrapped_model.load_state_dict(state_dict_model)
 
         if 'optimizer' not in state_dict:
             return
@@ -358,18 +345,16 @@ class TaskTrain(Task):
         # restore optimization related state
         if restore_optimizer_state:
             self.optimizer.load_state_dict(state_dict['optimizer'])
-            if 'scaler' in state_dict:
+            if 'scaler' in state_dict and self.scaler is not None:
                 self.scaler.load_state_dict(state_dict['scaler'])
         if restore_scheduler_state:
             # restore LR schedule / step / interval related state
             if 'scheduler' in state_dict:
                 self.scheduler.load_state_dict(state_dict['scheduler'])
-            if 'step_idx' in state_dict:
-                self.step_idx = state_dict['step_idx']
-            if 'batch_idx' in state_dict:
-                self.batch_idx = state_dict['batch_idx']
+            self.step_idx = state_dict.get('step_idx', self.step_idx)
+            self.batch_idx = state_dict.get('batch_idx', self.batch_idx)
             if start_interval is not None:
-                # override saved interval
                 self.interval_idx = start_interval
-            elif 'interval_idx' in state_dict:
-                self.interval_idx = state_dict['interval_idx']
+            else:
+                self.interval_idx = state_dict.get('interval_idx', self.interval_idx)
+            self.scheduler.step_update(self.step_idx)

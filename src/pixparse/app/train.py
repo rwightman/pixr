@@ -1,124 +1,111 @@
+""" pixparse training app
+
+Example (pretrain on IDL streamed from the HF Hub, 2 GPUs):
+    torchrun --nproc_per_node 2 -m pixparse.app.train \\
+        --task cruller_pretrain \\
+        --task.model.name cruller_naflex_clip_base \\
+        --train-data.source "pipe:curl -s -f -L https://huggingface.co/datasets/pixparse/idl-wds/resolve/main/idl-train-0{0000..2999}.tar" \\
+        --train-data.num-samples 1000000 --train-data.batch-size 16 --train-data.num-workers 16
+"""
 import logging
 import os
-from dataclasses import dataclass, replace
+import sys
+from dataclasses import dataclass, field, replace
 from datetime import datetime
-from typing import Dict, Optional, Union
-
-import simple_parsing
-from simple_parsing import ArgumentParser, subgroups
-from simple_parsing.helpers import Serializable
+from typing import Optional
 
 import torch
 
-from pixparse.data import DataCfg, create_loader
-from pixparse.framework import (DeviceEnv, Monitor, train_one_interval, evaluate, setup_logging, random_seed,
-                                TaskTrain, TaskTrainCfg)
-from pixparse.utils import clean_name, load_checkpoint, get_selected_non_default_args
-from pixparse.task import get_train_task_from_cfg, get_train_task_cfgs
+from chug.common import DataArg, Serializable, parse_args
 
-from chug.common import LoaderBundle
-from chug.webdataset import create_doc_anno_pipe
+from pixparse.data import create_loader
+from pixparse.framework import DeviceEnv, Monitor, TaskTrain, train_one_interval, setup_logging, random_seed
+from pixparse.task import get_train_task, get_train_task_cfgs
+from pixparse.utils import clean_name, get_latest_checkpoint
 
 _logger = logging.getLogger('train')
 
 
 @dataclass
 class TrainCfg(Serializable):
-    train_data: DataCfg
-    eval_data: Optional[DataCfg] = None
-    task: TaskTrainCfg = subgroups(get_train_task_cfgs(), default='cruller_pretrain')
+    train_data: DataArg = field(default_factory=lambda: DataArg(source=''))
+    eval_data: Optional[DataArg] = None
+    task: Serializable = None  # selected task config (subgroup), set via --task <name>
 
-    experiment: Optional[str] = None  # experiment name, auto-generated if None or required?
+    experiment: Optional[str] = None  # experiment name, auto-generated if None
     output_dir: str = './output'
     log_filename: str = 'out.log'
-    resume: Optional[str] = ""  # resume checkpoint path w/ full model + optimizer state
-    checkpoint_path: Optional[str] = "" # general checkpoint path to initialize model with
-    output_checkpoint_dir: Optional[str] = None  # default output_dir/checkpoints
+    resume: str = ''  # resume training from checkpoint w/ full model + optimizer state ('latest' for most recent)
+    checkpoint_path: str = ''  # initialize model weights (and tokens / arch) from this checkpoint
+    eval_frequency: int = 1  # evaluate every N intervals (if eval_data set)
+    checkpoint_frequency: int = 1  # save checkpoint every N intervals (last interval always saved)
+    checkpoint_keep: int = 3  # number of most recent interval checkpoints to keep (0 == keep all)
     seed: int = 42
 
     wandb: bool = False
-    wandb_project: str = 'unknown'
+    wandb_project: str = 'pixparse'
     tensorboard: bool = False
     log_eval_data: bool = False
 
 
-def train(
-        cfg: TrainCfg,
-        task: TaskTrain,
-        loaders: Dict[str, LoaderBundle],
-):
+def _save_checkpoint(task, checkpoint_dir, interval, keep):
+    path = os.path.join(checkpoint_dir, f'checkpoint-{interval}.pt')
+    tmp_path = path + '.tmp'
+    torch.save(task.state_dict(), tmp_path)
+    os.replace(tmp_path, path)
+    latest = os.path.join(checkpoint_dir, 'checkpoint-latest.pt')
+    if os.path.lexists(latest):
+        os.remove(latest)
+    os.symlink(os.path.basename(path), latest)
+    if keep > 0:
+        stale = interval - keep * 1
+        for f in os.listdir(checkpoint_dir):
+            if f.startswith('checkpoint-') and f[len('checkpoint-'):-3].isdigit():
+                if int(f[len('checkpoint-'):-3]) <= stale:
+                    os.remove(os.path.join(checkpoint_dir, f))
+    return path
+
+
+def train(cfg: TrainCfg, task: TaskTrain, loaders, checkpoint_dir: str):
     device_env = task.device_env
     train_loader = loaders['train']
+    eval_loader = loaders.get('eval', None)
     for i in range(task.interval_idx, task.num_intervals):
-        # FIXME flatten interval loop to have one eval point
-        #  i.e step intervals vs epoch intervals handled similarly?
         train_loader.set_interval(i)
-        train_one_interval(
-            task,
-            train_loader,
-        )
+        train_stats = train_one_interval(task, train_loader)
+        results = {'train': train_stats}
 
-        # save checkpoint
+        last = i + 1 == task.num_intervals
+        if eval_loader is not None and ((i + 1) % cfg.eval_frequency == 0 or last):
+            eval_metrics = task.evaluate(eval_loader.loader)
+            results['eval'] = eval_metrics
+            task.monitor.log_phase('eval', interval=i, **eval_metrics)
+
         if device_env.is_primary():
-            checkpoint_dir = os.path.join(cfg.output_checkpoint_dir, cfg.experiment)
-            os.makedirs(checkpoint_dir, exist_ok=True)
-            torch.save(task.state_dict(), os.path.join(checkpoint_dir, f'checkpoint-{i}.pt'))
-
-"""
-def load_checkpoint_cases(train_cfg, task):
-    # ----- Model resuming from checkpoint (non-fsdp) -----
-    if train_cfg.resume:
-        if not train_cfg.experiment:
-            raise ValueError(
-                f"resume set to {train_cfg.resume} and experiment directory not found at {train_cfg.experiment}.")
-        # FIXME add 'resume_latest' mode that scans experiment path for latest checkpoint
-        raise NotImplementedError("resume is not implemented yet. ")
-        if checkpoint_path.startswith('s3'):
-            _logger.info("s3 bucket specified. Loading checkpoint from s3 for resuming.")
-        else:
-            _logger.info("Loading checkpoint from local path for resuming.")
-        checkpoint = load_checkpoint(checkpoint_path)
-        task.load_state_dict(checkpoint, restore_optimizer_state=True)
-    # ----- Model being finetuned from checkpoint (non-fsdp) ----
-    elif train_cfg.checkpoint_path:
-        # FIXME improve naming/separation between resume and finetune, assert both can't be used at the same time!
-        checkpoint_path = train_cfg.checkpoint_path
-        if checkpoint_path.startswith('s3'):
-            _logger.info("s3 bucket specified. Loading checkpoint from s3 for finetuning.")
-        else:
-            _logger.info("Loading checkpoint from local path for finetuning.")
-        checkpoint = load_checkpoint(checkpoint_path)
-        task.load_state_dict(
-            checkpoint,
-            restore_optimizer_state=False,
-            restore_scheduler_state=False,
-            )
-"""
-
-parser = ArgumentParser(
-    add_option_string_dash_variants=simple_parsing.DashVariant.DASH,
-    argument_generation_mode=simple_parsing.ArgumentGenerationMode.BOTH,
-    add_config_path_arg=True,
-)
-parser.add_arguments(TrainCfg, dest='cfg')
+            task.monitor.write_summary(results, index=i)
+            if (i + 1) % cfg.checkpoint_frequency == 0 or last:
+                path = _save_checkpoint(task, checkpoint_dir, i, cfg.checkpoint_keep)
+                _logger.info(f'Saved checkpoint {path}')
 
 
-def main():
-    args = parser.parse_args()
-    train_cfg: TrainCfg = args.cfg
+def main(argv=None):
+    train_cfg: TrainCfg = parse_args(
+        TrainCfg,
+        argv=argv,
+        subgroups={'task': get_train_task_cfgs()},
+        subgroup_defaults={'task': 'cruller_pretrain'},
+        description='pixparse train',
+    )
+    task_name = next(k for k, v in get_train_task_cfgs().items() if isinstance(train_cfg.task, v))
+    task_cls = get_train_task(task_name)
 
     device_env = DeviceEnv()
     random_seed(train_cfg.seed, rank=device_env.global_rank)
-    _logger.info(f"Device env is {device_env}")
 
-    print(train_cfg.dumps_yaml())
-    task_name, task_cls = get_train_task_from_cfg(train_cfg.task)
-    # get the name of the experiments
     if train_cfg.experiment is None:
         model_name_safe = clean_name(train_cfg.task.model.name)
         date_str = datetime.now().strftime("%Y%m%d-%H%M%S")
         if device_env.world_size > 1:
-            # sync date_str from master to all ranks
             date_str = device_env.broadcast_object(date_str)
         experiment = '-'.join([
             date_str,
@@ -126,24 +113,28 @@ def main():
             f"model_{model_name_safe}",
             f"lr_{'{:.1e}'.format(train_cfg.task.opt.learning_rate)}",
             f"b_{train_cfg.train_data.batch_size}",
-            # TODO make completion of exp name derived from essential hparams
         ])
         train_cfg = replace(train_cfg, experiment=experiment)
 
-    resume_latest = False  # train_cfg.resume == 'latest'
     experiment_path = os.path.join(train_cfg.output_dir, train_cfg.experiment)
+    checkpoint_dir = os.path.join(experiment_path, 'checkpoints')
+    resume = train_cfg.resume
+    if resume == 'latest':
+        resume = get_latest_checkpoint(checkpoint_dir) or ''
     log_path = None
     if device_env.is_primary():
-        os.makedirs(experiment_path, exist_ok=True)
+        os.makedirs(checkpoint_dir, exist_ok=True)
         log_path = os.path.join(experiment_path, train_cfg.log_filename)
-        if os.path.exists(log_path) and not resume_latest:
-            _logger.error(
-                "Error. Experiment already exists. Use --experiment {} to specify a new experiment."
-            )
+        if os.path.exists(log_path) and not resume:
+            print(f"Experiment {train_cfg.experiment} already exists, set --resume or a new --experiment.")
             return -1
+        train_cfg.save(os.path.join(experiment_path, 'config.yaml'))
 
-    # Setup text logger
-    setup_logging(log_path)
+    setup_logging(log_path if device_env.is_primary() else None)
+    _logger.info(f"Device env is {device_env}")
+    if device_env.is_primary():
+        _logger.info('Train config:\n' + train_cfg.dumps_yaml())
+
     monitor = Monitor(
         train_cfg.experiment,
         output_dir=experiment_path,
@@ -151,53 +142,52 @@ def main():
         wandb_project=train_cfg.wandb_project,
         tensorboard=train_cfg.tensorboard,
         output_enabled=device_env.is_primary(),
+        log_eval_data=train_cfg.log_eval_data,
+        hparams=train_cfg.to_dict(),
     )
 
-    selected_args = ['task', 'resume', 'checkpoint_path']
-    rename_map = {'task': 'cfg'}
-    selected_non_default_args = get_selected_non_default_args(train_cfg, selected_args, rename_map)
     task = task_cls(
-        **selected_non_default_args,
+        train_cfg.task,
         device_env=device_env,
         monitor=monitor,
-
+        checkpoint_path=train_cfg.checkpoint_path,
     )
-
-    # FIXME Move this functionality to task_cls instance init so that all weight init is in init
-    # load_checkpoint_cases(train_cfg, task)
-
-    output_checkpoint_dir = train_cfg.output_checkpoint_dir or os.path.join(experiment_path, 'checkpoints')
-    os.makedirs(output_checkpoint_dir, exist_ok=True)
-    train_cfg = replace(train_cfg, output_checkpoint_dir=output_checkpoint_dir)
-    if device_env.is_primary():
-        _logger.info(train_cfg)
 
     loaders = {}
-    assert train_cfg.train_data is not None, f"Train dataset (train_cfg.train_data) must be set."
+    assert train_cfg.train_data.source, 'Train dataset (--train-data.source) must be set.'
     loaders['train'] = create_loader(
         train_cfg.train_data,
-        is_train=True,
-        collate_fn=task.collate_fn,
-        image_preprocess=task.image_preprocess_train,
-        anno_preprocess=task.anno_preprocess_train,
-        image_fmt=task.image_input_cfg.image_fmt,
+        task.train_data_cfg(),
+        is_training=True,
+        seed=train_cfg.seed,
         world_size=device_env.world_size,
         global_rank=device_env.global_rank,
-        create_decoder_pipe=create_doc_anno_pipe,  # TODO abstract away type of decoder needed
+        local_rank=device_env.local_rank,
     )
+    if train_cfg.eval_data is not None and train_cfg.eval_data.source:
+        assert hasattr(task, 'evaluate'), f'Task {task_name} does not support evaluation.'
+        loaders['eval'] = create_loader(
+            train_cfg.eval_data,
+            task.eval_data_cfg(),
+            is_training=False,
+            world_size=device_env.world_size,
+            global_rank=device_env.global_rank,
+            local_rank=device_env.local_rank,
+        )
+
     task.setup(
         num_batches_per_interval=loaders['train'].num_batches,
+        resume=resume,
     )
+    if resume:
+        loaders['train'].set_interval(task.interval_idx)
 
     if device_env.is_primary():
-        _logger.info(task)
+        num_params = sum(p.numel() for p in task.unwrapped_model.parameters())
+        _logger.info(f'Model params: {num_params / 1e6:.1f}M, steps per interval: {task.num_steps_per_interval}')
 
-    train(
-        train_cfg,
-        task,
-        loaders,
-    )
+    train(train_cfg, task, loaders, checkpoint_dir)
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
