@@ -4,9 +4,9 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-from chug.common import Serializable
+from chugr.common import Serializable
 
-from pixparse.utils.name_utils import _natural_key, clean_name
+from pixr.utils.name_utils import _natural_key, clean_name
 
 _MODEL_CONFIG_PATHS = [Path(__file__).parent / f"configs/"]
 _MODEL_CONFIGS = {}  # model_name: config
@@ -127,7 +127,7 @@ class ModelArgs:
 
         Args:
             model_cfg: base model config
-            from_checkpoint: weights will be loaded from a pixparse checkpoint, disable hub pretrained weights
+            from_checkpoint: weights will be loaded from a pixr checkpoint, disable hub pretrained weights
         """
         enc_updates = {}
         if self.image_size is not None:

@@ -1,4 +1,4 @@
-""" Batched greedy generation w/ KV caching for pixparse image -> text models.
+""" Batched greedy generation w/ KV caching for pixr image -> text models.
 
 Models implement a small incremental decoding interface:
     prefill(image_input, prompt_ids, prompt_mask) -> (next token logits [B, V], state)

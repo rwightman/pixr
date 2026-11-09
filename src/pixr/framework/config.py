@@ -1,8 +1,8 @@
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
-from pixparse.models import ModelArgs
-from pixparse.tokenizers import TokenizerCfg
+from pixr.models import ModelArgs
+from pixr.tokenizers import TokenizerCfg
 
 
 @dataclass
@@ -31,7 +31,7 @@ class TaskCfg:
     amp: bool = True
     model: ModelArgs = field(default_factory=ModelArgs)
     tokenizer: Optional[TokenizerCfg] = None  # default == text decoder name
-    image_transforms: Optional[str] = None  # chug transform type, default 'doc_naflex' or 'doc_better'
+    image_transforms: Optional[str] = None  # chugr transform type, default 'doc_naflex' or 'doc_better'
 
 
 @dataclass

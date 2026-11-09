@@ -3,12 +3,12 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
-from chug.common import ImageFeatureInfo
-from chug.doc import DEFAULT_DOC_KEY
+from chugr.common import ImageFeatureInfo
+from chugr.doc import DEFAULT_DOC_KEY
 
-from pixparse.models import ModelArgs, ModelCfg, Cruller, create_model, load_model_state
-from pixparse.tokenizers import TokenizerCfg, create_tokenizer, get_added_tokens
-from pixparse.utils import load_checkpoint
+from pixr.models import ModelArgs, ModelCfg, Cruller, create_model, load_model_state
+from pixr.tokenizers import TokenizerCfg, create_tokenizer, get_added_tokens
+from pixr.utils import load_checkpoint
 
 _logger = logging.getLogger(__name__)
 
@@ -19,7 +19,7 @@ def init_model_and_tokenizer(
         task_tokens: Sequence[str],
         checkpoint_path: str = '',
 ) -> Tuple[Cruller, Any]:
-    """ Create tokenizer (w/ task tokens) and model, optionally initialized from a pixparse checkpoint.
+    """ Create tokenizer (w/ task tokens) and model, optionally initialized from a pixr checkpoint.
 
     When a checkpoint is given, its model config (architecture) and added tokens are used. The checkpoint's
     tokens are added before the task tokens so existing token embedding rows line up, new task tokens are

@@ -1,7 +1,7 @@
-""" pixparse evaluation app
+""" pixr evaluation app
 
 Example (DocVQA validation ANLS):
-    python -m pixparse.app.eval \\
+    python -m pixr.app.eval \\
         --task cruller_eval_docvqa \\
         --eval-data.source pixparse/docvqa-single-page-questions --eval-data.split validation \\
         --eval-data.format hfds --eval-data.batch-size 32 \\
@@ -14,11 +14,11 @@ import sys
 from dataclasses import dataclass, field
 from typing import Optional
 
-from chug.common import DataArg, Serializable, parse_args
+from chugr.common import DataArg, Serializable, parse_args
 
-from pixparse.data import create_loader
-from pixparse.framework import DeviceEnv, setup_logging, random_seed
-from pixparse.task import get_eval_task, get_eval_task_cfgs
+from pixr.data import create_loader
+from pixr.framework import DeviceEnv, setup_logging, random_seed
+from pixr.task import get_eval_task, get_eval_task_cfgs
 
 _logger = logging.getLogger('eval')
 
@@ -38,7 +38,7 @@ def main(argv=None):
         argv=argv,
         subgroups={'task': get_eval_task_cfgs()},
         subgroup_defaults={'task': 'cruller_eval_docvqa'},
-        description='pixparse eval',
+        description='pixr eval',
     )
     task_name = next(k for k, v in get_eval_task_cfgs().items() if isinstance(eval_cfg.task, v))
     task_cls = get_eval_task(task_name)

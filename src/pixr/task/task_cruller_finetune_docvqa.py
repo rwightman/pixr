@@ -4,10 +4,10 @@ from typing import Any, Dict
 
 import torch.nn.functional as F
 
-import chug
+import chugr
 
-from pixparse.data import create_image_preprocessor
-from pixparse.framework import DeviceEnv, Monitor, TaskTrain, TaskTrainCfg
+from pixr.data import create_image_preprocessor
+from pixr.framework import DeviceEnv, Monitor, TaskTrain, TaskTrainCfg
 from .common import init_model_and_tokenizer, checkpoint_extra_state, to_device, trim_padding
 from .task_cruller_eval_docvqa import DOCVQA_START_TOKEN, DOCVQA_TOKENS, DocVqaEvaluator, docvqa_task_cfg, \
     evaluate_docvqa
@@ -52,7 +52,7 @@ class TaskCrullerFinetuneDocVqa(TaskTrain):
         self.pad_token_id = self.tokenizer.pad_token_id
         self.input_info = self.model.image_encoder.input_info
 
-        self.text_preprocess_train = chug.create_text_preprocessor(
+        self.text_preprocess_train = chugr.create_text_preprocessor(
             self.tokenizer,
             max_length=cfg.text_max_length,
             task_start_token=self.task_start_token,

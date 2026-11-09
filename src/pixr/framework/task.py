@@ -11,7 +11,7 @@ import timm.utils
 from timm.optim import create_optimizer_v2
 from timm.scheduler import create_scheduler_v2
 
-from pixparse.utils import clean_state_dict
+from pixr.utils import clean_state_dict
 from .config import TaskTrainCfg, TaskEvalCfg, TaskCfg
 from .device import DeviceEnv
 from .monitor import Monitor
@@ -156,7 +156,7 @@ class TaskTrain(Task):
         self._setup_optimization(num_batches_per_interval=num_batches_per_interval)
 
         if resume:
-            from pixparse.utils import load_checkpoint
+            from pixr.utils import load_checkpoint
             state_dict = load_checkpoint(resume)
             self.load_state_dict(state_dict, restore_optimizer_state=True, restore_scheduler_state=True)
             _logger.info(f'Resumed from {resume} at interval {self.interval_idx}, step {self.step_idx}.')

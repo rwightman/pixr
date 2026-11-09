@@ -6,7 +6,7 @@ CHECKPOINT=${CHECKPOINT:?set CHECKPOINT}
 SPLIT=${SPLIT:-validation}
 NUM_GPUS=${NUM_GPUS:-1}
 
-python -m torch.distributed.run --nproc_per_node "${NUM_GPUS}" -m pixparse.app.eval \
+python -m torch.distributed.run --nproc_per_node "${NUM_GPUS}" -m pixr.app.eval \
   --task cruller_eval_docvqa \
   --checkpoint-path "${CHECKPOINT}" \
   --eval-data.source pixparse/docvqa-single-page-questions \

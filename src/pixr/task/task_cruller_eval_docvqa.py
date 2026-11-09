@@ -6,12 +6,12 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
-import chug
+import chugr
 
-from pixparse.data import create_image_preprocessor
-from pixparse.framework import DeviceEnv, Monitor, TaskEval, TaskEvalCfg
-from pixparse.generation import generate_greedy
-from pixparse.utils import anls_score
+from pixr.data import create_image_preprocessor
+from pixr.framework import DeviceEnv, Monitor, TaskEval, TaskEvalCfg
+from pixr.generation import generate_greedy
+from pixr.utils import anls_score
 from .common import init_model_and_tokenizer, image_feature_info, to_device
 
 _logger = logging.getLogger(__name__)
@@ -26,15 +26,15 @@ def docvqa_task_cfg(
         text_process_fn=None,
         is_training: bool = True,
 ):
-    """ chug DocVQA pipeline cfg. Samples: '<s_question>{q}</s_question><s_answer>[{a}</s_answer>]'.
+    """ chugr DocVQA pipeline cfg. Samples: '<s_question>{q}</s_question><s_answer>[{a}</s_answer>]'.
 
     For eval (no text_process_fn / target) the text input is the prompt string up to '<s_answer>'.
     """
-    return chug.DataTaskDocVqaCfg(
+    return chugr.DataTaskDocVqaCfg(
         image_process_fn=image_process_fn,
         text_process_fn=text_process_fn,
         image_input_feat=image_feature_info(image_fmt),
-        text_target_feat=chug.FeatureInfo('text_target', input_key=None) if is_training else None,
+        text_target_feat=chugr.FeatureInfo('text_target', input_key=None) if is_training else None,
         error_handler='log_and_continue' if is_training else 'reraise_exception',
     )
 

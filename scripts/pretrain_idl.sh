@@ -20,7 +20,7 @@ CURL="curl -s -f -L --http1.1 --retry 10 --retry-all-errors"
 IDL_SOURCE=${IDL_SOURCE:-"pipe:${CURL} https://huggingface.co/datasets/pixparse/idl-wds/resolve/main/idl-train-0{0001..2999}.tar"}
 EXPERIMENT=${EXPERIMENT:-pretrain_${MODEL}_idl}
 
-python -m torch.distributed.run --nproc_per_node "${NUM_GPUS}" -m pixparse.app.train \
+python -m torch.distributed.run --nproc_per_node "${NUM_GPUS}" -m pixr.app.train \
   --task cruller_pretrain \
   --task.model.name "${MODEL}" \
   --train-data.source "${IDL_SOURCE}" \

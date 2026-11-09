@@ -1,4 +1,7 @@
-# Pixel Parsing (`pixparse`)
+# Pixel Reading (`pixr`)
+
+Continuation of the original `pixparse` project (huggingface/pixparse, 2023), renamed and revived. Data
+pipelines are provided by [`chugr`](https://github.com/rwightman/chugr) (formerly `chug`).
 
 ## Introduction
 
@@ -13,7 +16,7 @@ The training objectives and pretraining datasets will also be inspired by the as
 
 ## Status (revive branch)
 
-The `revive` branch ports `pixparse` to `chug` 0.2, NaFlexVit (native aspect / variable resolution) image encoders,
+The `revive` branch ports `pixr` to `chugr` 0.2, NaFlexVit (native aspect / variable resolution) image encoders,
 a self-contained text decoder, and fixes a number of issues that hampered the original DocVQA results:
 
 * DocVQA fine-tune loss was applied to question + answer tokens (prompt masking used the task start token)
@@ -33,7 +36,7 @@ Three model families share the same tasks, data pipelines, loss masking and (gre
   LM w/ prefix-LM attention (PaLI / LLaVA style)
 * **Cronut** -- native decoder-only transformer over image patches and text (placeholder, not implemented yet)
 
-Model configs live in `src/pixparse/models/configs`:
+Model configs live in `src/pixr/models/configs`:
 
 | config | image encoder | text decoder |
 |---|---|---|
@@ -80,7 +83,7 @@ only need `--checkpoint-path`, task tokens are appended and their embeddings ini
 
 ## Code Organization
 
-Within `src/pixparse`:
+Within `src/pixr`:
 * `app/` - CLI applications for training and evaluation
   * `app/train.py` - main training CLI entrypoint, will attempt to keep useable across tasks
   * `app/eval.py` - main evaluation CLI entrypoint

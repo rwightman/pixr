@@ -16,7 +16,7 @@ LR=${LR:-5e-5}
 MAX_SEQ_LEN=${MAX_SEQ_LEN:-4096}
 EXPERIMENT=${EXPERIMENT:-finetune_docvqa}
 
-python -m torch.distributed.run --nproc_per_node "${NUM_GPUS}" -m pixparse.app.train \
+python -m torch.distributed.run --nproc_per_node "${NUM_GPUS}" -m pixr.app.train \
   --task cruller_finetune_docvqa \
   --checkpoint-path "${CHECKPOINT}" \
   --task.model.max-seq-len "${MAX_SEQ_LEN}" \

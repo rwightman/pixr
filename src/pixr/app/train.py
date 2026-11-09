@@ -1,7 +1,7 @@
-""" pixparse training app
+""" pixr training app
 
 Example (pretrain on IDL streamed from the HF Hub, 2 GPUs):
-    torchrun --nproc_per_node 2 -m pixparse.app.train \\
+    torchrun --nproc_per_node 2 -m pixr.app.train \\
         --task cruller_pretrain \\
         --task.model.name cruller_naflex_clip_base \\
         --train-data.source "pipe:curl -s -f -L https://huggingface.co/datasets/pixparse/idl-wds/resolve/main/idl-train-0{0000..2999}.tar" \\
@@ -16,12 +16,12 @@ from typing import Optional
 
 import torch
 
-from chug.common import DataArg, Serializable, parse_args
+from chugr.common import DataArg, Serializable, parse_args
 
-from pixparse.data import create_loader
-from pixparse.framework import DeviceEnv, Monitor, TaskTrain, train_one_interval, setup_logging, random_seed
-from pixparse.task import get_train_task, get_train_task_cfgs
-from pixparse.utils import clean_name, get_latest_checkpoint
+from pixr.data import create_loader
+from pixr.framework import DeviceEnv, Monitor, TaskTrain, train_one_interval, setup_logging, random_seed
+from pixr.task import get_train_task, get_train_task_cfgs
+from pixr.utils import clean_name, get_latest_checkpoint
 
 _logger = logging.getLogger('train')
 
@@ -43,7 +43,7 @@ class TrainCfg(Serializable):
     seed: int = 42
 
     wandb: bool = False
-    wandb_project: str = 'pixparse'
+    wandb_project: str = 'pixr'
     tensorboard: bool = False
     log_eval_data: bool = False
 
@@ -94,7 +94,7 @@ def main(argv=None):
         argv=argv,
         subgroups={'task': get_train_task_cfgs()},
         subgroup_defaults={'task': 'cruller_pretrain'},
-        description='pixparse train',
+        description='pixr train',
     )
     task_name = next(k for k, v in get_train_task_cfgs().items() if isinstance(train_cfg.task, v))
     task_cls = get_train_task(task_name)

@@ -3,7 +3,7 @@ from typing import Optional, Union
 
 import torch
 
-from pixparse.utils import load_checkpoint, clean_state_dict
+from pixr.utils import load_checkpoint, clean_state_dict
 from .config import ModelCfg, get_model_config
 from .cruller import Cruller
 from .cronut import Cronut
@@ -24,13 +24,13 @@ def create_model(
         pad_token_id: int = 1,
         pretrained: Optional[str] = '',
 ):
-    """ Create a model, optionally initializing from a pixparse checkpoint.
+    """ Create a model, optionally initializing from a pixr checkpoint.
 
     Args:
         model_name_or_cfg: The name of the model or its configuration.
         vocab_size: Vocab size (len(tokenizer)) incl. any added task tokens.
         pad_token_id: Padding token id.
-        pretrained: Path to a pixparse checkpoint to initialize weights from. When the checkpoint vocab is
+        pretrained: Path to a pixr checkpoint to initialize weights from. When the checkpoint vocab is
             smaller (tokens added for a new task), the embedding rows that exist are loaded and the rest keep
             their init. NOTE task tokens must be added to the tokenizer after the checkpoint's tokens.
     """

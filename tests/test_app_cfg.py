@@ -1,8 +1,8 @@
-from chug.common import parse_args
+from chugr.common import parse_args
 
-from pixparse.app.train import TrainCfg
-from pixparse.app.eval import EvalCfg
-from pixparse.task import (
+from pixr.app.train import TrainCfg
+from pixr.app.eval import EvalCfg
+from pixr.task import (
     get_train_task_cfgs, get_eval_task_cfgs, TaskCrullerFinetuneDocVqaCfg, TaskCrullerPretrainCfg, TaskCrullerEvalDocVqaCfg
 )
 

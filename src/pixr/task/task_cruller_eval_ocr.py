@@ -5,12 +5,12 @@ from dataclasses import dataclass
 
 import torch
 
-import chug
+import chugr
 
-from pixparse.data import create_image_preprocessor
-from pixparse.framework import DeviceEnv, Monitor, TaskEval, TaskEvalCfg
-from pixparse.generation import generate_greedy
-from pixparse.utils import text_error_rates
+from pixr.data import create_image_preprocessor
+from pixr.framework import DeviceEnv, Monitor, TaskEval, TaskEvalCfg
+from pixr.generation import generate_greedy
+from pixr.utils import text_error_rates
 from .common import init_model_and_tokenizer, image_feature_info, to_device
 from .task_cruller_pretrain import TaskCrullerPretrain
 
@@ -54,7 +54,7 @@ class TaskCrullerEvalOcr(TaskEval):
         self.references = []
 
     def eval_data_cfg(self):
-        return chug.DataTaskDocReadCfg(
+        return chugr.DataTaskDocReadCfg(
             image_process_fn=self.image_preprocess_eval,
             text_process_fn=None,
             text_target_feat=None,

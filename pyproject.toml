@@ -3,7 +3,7 @@ requires = ["pdm-backend"]
 build-backend = "pdm.backend"
 
 [project]
-name = "pixparse"
+name = "pixr"
 authors = [
     {name = "Ross Wightman", email = "ross@huggingface.co"},
     {name = "Pablo Montalvo-Leroux", email = "pablo@huggingface.co"},
@@ -35,12 +35,16 @@ dependencies = [
     "transformers",  # tokenizers only
     "huggingface_hub",
     "safetensors",
-    "chug",
+    "chugr",
     "Levenshtein",
     "pyyaml",
 ]
 dynamic = ["version"]
 
+[project.urls]
+homepage = "https://github.com/rwightman/pixr"
+repository = "https://github.com/rwightman/pixr"
+
 [tool.pdm.version]
 source = "file"
-path = "src/pixparse/version.py"
+path = "src/pixr/version.py"

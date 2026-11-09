@@ -1,4 +1,4 @@
-from pixparse.utils import anls_score, average_normalized_levenshtein_similarity, text_error_rates
+from pixr.utils import anls_score, average_normalized_levenshtein_similarity, text_error_rates
 
 
 def test_anls():

@@ -2,11 +2,11 @@
 import pytest
 import torch
 
-from pixparse.models import (
+from pixr.models import (
     ModelArgs, ModelCfg, TextDecoderCfg, ImageEncoderCfg, TextDecoder, EttinTextDecoder, create_model,
     get_model_config, list_models, load_model_state, merge_patch_tokens,
 )
-from pixparse.generation import generate_greedy
+from pixr.generation import generate_greedy
 
 
 def _hf_bart_causal_lm(name):
@@ -192,7 +192,7 @@ def test_cronut_placeholder():
 
 def test_qwen3_decoder_matches_hf():
     import transformers
-    from pixparse.models import Qwen3TextDecoder
+    from pixr.models import Qwen3TextDecoder
     torch.manual_seed(0)
     cfg = TextDecoderCfg(type='qwen3', name='Qwen/Qwen3-0.6B-Base', num_layers=None, max_length=256, cross_attn_every=0)
     dec = Qwen3TextDecoder(cfg, vocab_size=151936, pad_token_id=151669).eval()

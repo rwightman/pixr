@@ -8,7 +8,7 @@ import torch
 from torch import nn as nn
 from timm.models import adapt_input_conv
 
-from chug.common import image_mode_to_chs
+from chugr.common import image_mode_to_chs
 
 from .config import ImageEncoderCfg
 

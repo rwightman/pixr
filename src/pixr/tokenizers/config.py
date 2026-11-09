@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from chug.common import Serializable
+from chugr.common import Serializable
 
 
 @dataclass

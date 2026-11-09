@@ -5,12 +5,12 @@ from typing import Any, Dict
 import torch
 import torch.nn.functional as F
 
-import chug
+import chugr
 
-from pixparse.data import create_image_preprocessor
-from pixparse.framework import TaskTrainCfg, TaskTrain, DeviceEnv, Monitor
-from pixparse.generation import generate_greedy
-from pixparse.utils import text_error_rates
+from pixr.data import create_image_preprocessor
+from pixr.framework import TaskTrainCfg, TaskTrain, DeviceEnv, Monitor
+from pixr.generation import generate_greedy
+from pixr.utils import text_error_rates
 from .common import init_model_and_tokenizer, checkpoint_extra_state, image_feature_info, to_device, trim_padding
 
 _logger = logging.getLogger(__name__)
@@ -59,7 +59,7 @@ class TaskCrullerPretrain(TaskTrain):
         self.pad_token_id = self.tokenizer.pad_token_id
         self.input_info = self.model.image_encoder.input_info
 
-        self.text_preprocess_train = chug.create_text_preprocessor(
+        self.text_preprocess_train = chugr.create_text_preprocessor(
             self.tokenizer,
             max_length=cfg.text_max_length,
             task_start_token=self.task_start_token,
@@ -72,7 +72,7 @@ class TaskCrullerPretrain(TaskTrain):
         )
 
     def train_data_cfg(self):
-        return chug.DataTaskDocReadCfg(
+        return chugr.DataTaskDocReadCfg(
             image_process_fn=self.image_preprocess_train,
             text_process_fn=self.text_preprocess_train,
             image_input_feat=image_feature_info(self.input_info['image_fmt']),

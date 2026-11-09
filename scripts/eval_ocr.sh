@@ -6,7 +6,7 @@ CHECKPOINT=${CHECKPOINT:?set CHECKPOINT}
 NUM_SAMPLES=${NUM_SAMPLES:-500}
 SOURCE=${SOURCE:-"pipe:curl -s -f -L https://huggingface.co/datasets/pixparse/idl-wds/resolve/main/idl-train-00000.tar"}
 
-python -m pixparse.app.eval \
+python -m pixr.app.eval \
   --task cruller_eval_ocr \
   --checkpoint-path "${CHECKPOINT}" \
   --eval-data.source "${SOURCE}" \

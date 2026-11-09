@@ -1,7 +1,7 @@
 from typing import Optional
 
-import chug
-from chug.common import DataArg, DataCfg, DataTaskCfg, DistributedCfg, LoaderBundle
+import chugr
+from chugr.common import DataArg, DataCfg, DataTaskCfg, DistributedCfg, LoaderBundle
 
 
 def create_loader(
@@ -14,9 +14,9 @@ def create_loader(
         global_rank: int = 0,
         local_rank: int = 0,
 ) -> LoaderBundle:
-    """ Create a chug loader (webdataset or HF datasets) for the given task data pipeline config. """
+    """ Create a chugr loader (webdataset or HF datasets) for the given task data pipeline config. """
     data_cfg = DataCfg.from_arg(data)
-    return chug.create_loader(
+    return chugr.create_loader(
         data_cfg,
         task_cfg,
         is_training=is_training,

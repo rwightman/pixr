@@ -1,7 +1,7 @@
 from typing import Any, Dict, Optional
 
-import chug
-from chug.common import ImageInputCfg
+import chugr
+from chugr.common import ImageInputCfg
 
 
 def create_image_preprocessor(
@@ -17,7 +17,7 @@ def create_image_preprocessor(
     Args:
         input_info: model image input info
         is_training: enable train augmentations
-        transform_type: chug transform type, default 'doc_naflex' for NaFlex models, else 'doc_better'
+        transform_type: chugr transform type, default 'doc_naflex' for NaFlex models, else 'doc_better'
     """
     naflex = input_info['naflex']
     if transform_type is None:
@@ -35,4 +35,4 @@ def create_image_preprocessor(
         patch_size=input_info['patch_size'],
         max_seq_len=input_info['max_seq_len'],
     )
-    return chug.create_image_preprocessor(cfg, is_training=is_training)
+    return chugr.create_image_preprocessor(cfg, is_training=is_training)
