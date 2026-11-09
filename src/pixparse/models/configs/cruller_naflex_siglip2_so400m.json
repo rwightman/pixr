@@ -1,0 +1,14 @@
+{
+    "type": "cruller",
+    "image_encoder": {
+        "name": "naflexvit_so400m_patch16_siglip.v2_webli",
+        "image_fmt": "L",
+        "max_seq_len": 4096
+    },
+    "text_decoder": {
+        "name": "facebook/bart-large",
+        "pretrained": true,
+        "num_layers": 8,
+        "max_length": 1024
+    }
+}

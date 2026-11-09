@@ -1,12 +1,11 @@
 from dataclasses import replace
-from typing import Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 
-from .config import ModelCfg
+from .config import ModelCfg, TextDecoderCfg
 from .image_encoder_timm import ImageEncoderTimm
-from .config import TextDecoderCfg
 from .text_decoder import TextDecoder
 from .text_decoder_ettin import EttinTextDecoder
 
@@ -28,6 +27,10 @@ class Cruller(nn.Module):
         self.image_encoder = ImageEncoderTimm(cfg.image_encoder, out_dim=self.text_decoder.dim)
         # resolved config, sufficient to rebuild the model architecture (w/o pretrained weights)
         self.cfg = replace(cfg, image_encoder=self.image_encoder.cfg, text_decoder=self.text_decoder.cfg)
+
+    @property
+    def max_text_length(self) -> int:
+        return self.text_decoder.max_length
 
     @torch.jit.ignore
     def set_grad_checkpointing(self, enable=True):
@@ -59,3 +62,40 @@ class Cruller(nn.Module):
             encoder_hidden_states=encoder_output,
             encoder_mask=encoder_mask,
         )
+
+    def prefill(self, image_input, prompt_ids: torch.Tensor, prompt_mask: torch.Tensor):
+        """ Encode image + (left padded) prompts, returns next token logits and decoding state. """
+        encoder_output, encoder_mask = self.encode(image_input)
+        cross_kv = self.text_decoder.project_cross_kv(encoder_output)
+        cache = [{} for _ in self.text_decoder.layers]
+        position_ids = (prompt_mask.long().cumsum(1) - 1).clamp(min=0)
+        logits = self.text_decoder(
+            prompt_ids,
+            cross_kv=cross_kv,
+            encoder_mask=encoder_mask,
+            position_ids=position_ids,
+            attention_mask=prompt_mask,
+            cache=cache,
+        )
+        state = dict(
+            cross_kv=cross_kv,
+            encoder_mask=encoder_mask,
+            cache=cache,
+            attn_mask=prompt_mask,
+            pos=position_ids[:, -1],
+        )
+        return logits[:, -1], state
+
+    def step(self, token_ids: torch.Tensor, state: Dict[str, Any]):
+        """ Decode one token per sample w/ cached state, returns next token logits and updated state. """
+        state['pos'] = state['pos'] + 1
+        state['attn_mask'] = torch.cat([state['attn_mask'], state['attn_mask'].new_ones(token_ids.shape)], dim=1)
+        logits = self.text_decoder(
+            token_ids,
+            cross_kv=state['cross_kv'],
+            encoder_mask=state['encoder_mask'],
+            position_ids=state['pos'][:, None],
+            attention_mask=state['attn_mask'],
+            cache=state['cache'],
+        )
+        return logits[:, -1], state

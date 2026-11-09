@@ -6,11 +6,13 @@ import torch
 from pixparse.utils import load_checkpoint, clean_state_dict
 from .config import ModelCfg, get_model_config
 from .cruller import Cruller
+from .eclair import Eclair
 
 _logger = logging.getLogger(__name__)
 
 _MODEL_TYPES = {
     'cruller': Cruller,
+    'eclair': Eclair,
 }
 
 

@@ -147,7 +147,8 @@ class EttinTextDecoder(nn.Module):
 
         self.embed_tokens = nn.Embedding(vocab_size, cfg.dim, padding_idx=pad_token_id)
         self.embed_norm = nn.LayerNorm(cfg.dim, eps=cfg.norm_eps, bias=False)
-        cross_every = max(cfg.cross_attn_every, 1)
+        cross_every = cfg.cross_attn_every  # <= 0 disables cross-attention (prefix / decoder-only use)
+        self.has_cross_attn = cross_every > 0
         self.layers = nn.ModuleList([
             EttinDecoderLayer(
                 cfg.dim,
@@ -155,7 +156,7 @@ class EttinTextDecoder(nn.Module):
                 cfg.ffn_dim,
                 layer_idx=i,
                 is_global=i % cfg.global_attn_every == 0,
-                has_cross_attn=i % cross_every == cross_every - 1,
+                has_cross_attn=cross_every > 0 and i % cross_every == cross_every - 1,
                 qk_norm_cross=cfg.qk_norm_cross,
                 norm_eps=cfg.norm_eps,
                 dropout=cfg.dropout,
@@ -236,47 +237,83 @@ class EttinTextDecoder(nn.Module):
             position_ids: Optional[torch.Tensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
             cache: Optional[List[Dict[str, torch.Tensor]]] = None,
+            prefix_embeds: Optional[torch.Tensor] = None,
+            prefix_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """
+        Args:
+            input_ids: [B, T] text token ids
+            encoder_hidden_states / encoder_mask / cross_kv: cross-attention inputs (if cross-attn enabled)
+            position_ids: [B, T(+P)] RoPE positions, default derived from attention_mask (or arange)
+            attention_mask: [B, past + P + T] bool key validity over the full sequence
+            cache: per-layer self-attention KV caches
+            prefix_embeds: [B, P, C] prefix (e.g. image) embeddings, prepended to the text, bidirectional
+                attention within the prefix (prefix-LM). Only valid w/o past cache (training or prefill).
+            prefix_mask: [B, P] bool validity of prefix positions
+
+        Returns:
+            logits [B, T, V] for the text positions only
+        """
         B, T = input_ids.shape
         device = input_ids.device
         past_len = cache[0]['k'].shape[2] if cache is not None and 'k' in cache[0] else 0
-        if position_ids is None:
-            position_ids = torch.arange(past_len, past_len + T, device=device).unsqueeze(0).expand(B, -1)
-        rope = self._rope(position_ids, None)
 
         x = self.embed_norm(self.embed_tokens(input_ids))
+        P = 0
+        if prefix_embeds is not None:
+            assert past_len == 0, 'Prefix embeddings can only be passed w/o past cache.'
+            P = prefix_embeds.shape[1]
+            x = torch.cat([self.embed_norm(prefix_embeds).to(x.dtype), x], dim=1)
+            if attention_mask is None and prefix_mask is not None:
+                attention_mask = torch.cat([prefix_mask.bool(), prefix_mask.new_ones(B, T, dtype=torch.bool)], dim=1)
         x = F.dropout(x, p=self.cfg.dropout, training=self.training)
+        L = P + T  # current (new) sequence length
+        S = past_len + L  # total key length
 
-        if cross_kv is None:
-            assert encoder_hidden_states is not None
-            cross_kv = self.project_cross_kv(encoder_hidden_states)
-        cross_mask = encoder_mask[:, None, None, :] if encoder_mask is not None else None
+        if position_ids is None:
+            if attention_mask is not None:
+                # contiguous positions over valid tokens (padding inside the prefix or left padded prompts)
+                position_ids = (attention_mask[:, :S].long().cumsum(1) - 1).clamp(min=0)[:, past_len:]
+            else:
+                position_ids = torch.arange(past_len, S, device=device).unsqueeze(0).expand(B, -1)
+        rope = self._rope(position_ids, None)
+
+        if self.has_cross_attn:
+            if cross_kv is None:
+                assert encoder_hidden_states is not None
+                cross_kv = self.project_cross_kv(encoder_hidden_states)
+            cross_mask = encoder_mask[:, None, None, :] if encoder_mask is not None else None
+        else:
+            cross_kv = [None] * len(self.layers)
+            cross_mask = None
 
         # self-attention masks (bool, True == attend), sequence index based like HF
-        S = past_len + T
         q_idx = torch.arange(past_len, S, device=device)[:, None]
         k_idx = torch.arange(S, device=device)[None, :]
-        causal = k_idx <= q_idx
-        local = causal & (k_idx > q_idx - self.sliding_window)
+        allowed = k_idx <= q_idx
+        if P > 0:
+            allowed = allowed | ((q_idx < P) & (k_idx < P))  # bidirectional prefix
+        local = allowed & (k_idx > q_idx - self.sliding_window) & (k_idx < q_idx + self.sliding_window)
         if attention_mask is not None:
             key_valid = attention_mask[:, None, None, :S].bool()
             diag = k_idx == q_idx
-            global_mask = (causal[None, None] & key_valid) | diag[None, None]
+            global_mask = (allowed[None, None] & key_valid) | diag[None, None]
             local_mask = (local[None, None] & key_valid) | diag[None, None]
         else:
-            simple_causal = past_len == 0 or T == 1
-            global_mask = None if simple_causal else causal[None, None]
+            simple_causal = P == 0 and (past_len == 0 or L == 1)
+            global_mask = None if simple_causal else allowed[None, None]
             local_mask = local[None, None]
 
         for i, layer in enumerate(self.layers):
             mask = global_mask if layer.is_global else local_mask
-            is_causal = layer.is_global and mask is None and T > 1
+            is_causal = layer.is_global and mask is None and L > 1
             layer_cache = cache[i] if cache is not None else None
             if self.grad_checkpointing and self.training and layer_cache is None:
                 x = checkpoint(layer, x, rope, cross_kv[i], cross_mask, mask, is_causal, None, use_reentrant=False)
             else:
                 x = layer(x, rope, cross_kv[i], cross_mask, mask, is_causal, layer_cache)
 
+        x = x[:, P:]
         x = self.final_norm(x)
         x = self.head_norm(F.gelu(self.head_dense(x)))
         return F.linear(x, self.embed_tokens.weight, self.output_bias)

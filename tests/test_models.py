@@ -4,7 +4,7 @@ import torch
 
 from pixparse.models import (
     ModelArgs, ModelCfg, TextDecoderCfg, ImageEncoderCfg, TextDecoder, EttinTextDecoder, create_model,
-    get_model_config, list_models, load_model_state,
+    get_model_config, list_models, load_model_state, merge_patch_tokens,
 )
 from pixparse.generation import generate_greedy
 
@@ -94,17 +94,81 @@ def test_model_configs_and_overrides():
     assert get_model_config('cruller_naflex_clip_base').image_encoder.max_seq_len == 4096  # registry unchanged
 
 
-def _tiny_cfg():
+def _tiny_cfg(model_type='cruller'):
+    image_encoder = ImageEncoderCfg(
+        name='naflexvit', pretrained=False, image_fmt='L', max_seq_len=64,
+        model_kwargs=dict(patch_size=16, embed_dim=64, depth=2, num_heads=2, class_token=True, pre_norm=True),
+    )
+    if model_type == 'eclair':
+        return ModelCfg(
+            type='eclair',
+            image_encoder=image_encoder,
+            text_decoder=TextDecoderCfg(
+                type='ettin', pretrained=False, num_layers=3, dim=64, num_heads=2, ffn_dim=96, max_length=64,
+                sliding_window=4, global_attn_every=2, cross_attn_every=0),
+            prefix_token_merge=2,
+        )
     return ModelCfg(
-        image_encoder=ImageEncoderCfg(
-            name='naflexvit', pretrained=False, image_fmt='L', max_seq_len=64,
-            model_kwargs=dict(patch_size=16, embed_dim=64, depth=2, num_heads=2, class_token=True, pre_norm=True),
-        ),
+        image_encoder=image_encoder,
         text_decoder=TextDecoderCfg(pretrained=False, num_layers=2, dim=64, num_heads=2, ffn_dim=128, max_length=64),
     )
 
 
-def test_checkpoint_vocab_expansion_and_generate(tmp_path):
+def _patches(B=2, H=4, W=3, num_invalid=4):
+    coord = torch.stack(torch.meshgrid(torch.arange(H), torch.arange(W), indexing='ij'), -1).reshape(1, H * W, 2)
+    valid = torch.ones(B, H * W, dtype=torch.bool)
+    valid[1, H * W - num_invalid:] = False
+    return {'patches': torch.randn(B, H * W, 256), 'patch_coord': coord.expand(B, -1, -1), 'patch_valid': valid}
+
+
+def test_merge_patch_tokens():
+    H, W, C = 4, 6, 3
+    coord = torch.stack(torch.meshgrid(torch.arange(H), torch.arange(W), indexing='ij'), -1).reshape(1, H * W, 2)
+    tokens = torch.arange(H * W * C, dtype=torch.float).reshape(1, H * W, C)
+    merged, valid = merge_patch_tokens(tokens, torch.ones(1, H * W, dtype=torch.bool), coord, 2)
+    assert merged.shape == (1, 6, 12) and valid.all()
+    # reference: pixel unshuffle of the (H, W, C) grid
+    grid = tokens.reshape(H, W, C)
+    ref = grid.reshape(H // 2, 2, W // 2, 2, C).permute(0, 2, 1, 3, 4).reshape(1, 6, 4 * C)
+    assert torch.equal(merged, ref)
+
+
+@pytest.mark.parametrize('model_type', ['cruller', 'eclair'])
+def test_greedy_matches_teacher_forced(model_type):
+    torch.manual_seed(0)
+    model = create_model(_tiny_cfg(model_type), vocab_size=100, pad_token_id=1).eval()
+    patches = _patches()
+    prompts = [[5], [6, 7, 8]]
+    out = generate_greedy(model, patches, prompt_ids=prompts, stop_token_ids=[2], pad_token_id=1, max_new_tokens=12)
+    assert len(out) == 2 and all(1 <= len(o) <= 12 for o in out)
+    for i, prompt in enumerate(prompts):
+        single = {k: v[i:i + 1] for k, v in patches.items()}
+        seq = torch.tensor([prompt + out[i]])
+        with torch.no_grad():
+            logits = model(single, seq[:, :-1])
+        assert logits[0, len(prompt) - 1:].argmax(-1).tolist() == out[i]
+
+
+def test_ettin_prefix_lm_mask():
+    """ Prefix tokens attend bidirectionally (changing a later prefix token changes earlier prefix outputs is
+    not observable from text logits, so check text logits depend on all prefix tokens and causality of text). """
+    torch.manual_seed(0)
+    dec = EttinTextDecoder(_tiny_cfg('eclair').text_decoder, vocab_size=100, pad_token_id=1).eval()
+    prefix = torch.randn(1, 6, 64)
+    ids = torch.randint(3, 100, (1, 5))
+    with torch.no_grad():
+        a = dec(ids, prefix_embeds=prefix, prefix_mask=torch.ones(1, 6, dtype=torch.bool))
+        ids2 = ids.clone(); ids2[0, -1] = (ids2[0, -1] + 1) % 100
+        b = dec(ids2, prefix_embeds=prefix, prefix_mask=torch.ones(1, 6, dtype=torch.bool))
+        # masking a prefix token (invalid) == removing it
+        m = torch.ones(1, 6, dtype=torch.bool); m[0, 2] = False
+        c = dec(ids, prefix_embeds=prefix, prefix_mask=m)
+        d = dec(ids, prefix_embeds=torch.cat([prefix[:, :2], prefix[:, 3:]], 1), prefix_mask=torch.ones(1, 5, dtype=torch.bool))
+    assert torch.allclose(a[:, :-1], b[:, :-1], atol=1e-5)  # text is causal
+    assert torch.allclose(c, d, atol=1e-4)  # padded prefix tokens are ignored, positions contiguous
+
+
+def test_checkpoint_vocab_expansion(tmp_path):
     torch.manual_seed(0)
     model = create_model(_tiny_cfg(), vocab_size=100, pad_token_id=1).eval()
     path = tmp_path / 'ckpt.pt'
@@ -117,17 +181,3 @@ def test_checkpoint_vocab_expansion_and_generate(tmp_path):
     assert torch.equal(w1, w2[:100])
     assert torch.allclose(w2[100:], w1.mean(0, keepdim=True).expand(5, -1))
 
-    patches = {
-        'patches': torch.randn(2, 12, 256),
-        'patch_coord': torch.stack(torch.meshgrid(torch.arange(4), torch.arange(3), indexing='ij'), -1).reshape(1, 12, 2).expand(2, -1, -1),
-        'patch_valid': torch.tensor([[True] * 12, [True] * 8 + [False] * 4]),
-    }
-    out = generate_greedy(model2, patches, prompt_ids=[[5], [6, 7, 8]], stop_token_ids=[2], pad_token_id=1, max_new_tokens=10)
-    assert len(out) == 2 and all(1 <= len(o) <= 10 for o in out)
-    # greedy decode must match teacher forced argmax
-    for i, prompt in enumerate([[5], [6, 7, 8]]):
-        single = {k: v[i:i + 1] for k, v in patches.items()}
-        seq = torch.tensor([prompt + out[i]])
-        with torch.no_grad():
-            logits = model2(single, seq[:, :-1])
-        assert logits[0, len(prompt) - 1:].argmax(-1).tolist() == out[i]
