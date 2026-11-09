@@ -80,6 +80,9 @@ class ImageEncoderTimm(nn.Module):
             timm_kwargs['drop_path_rate'] = cfg.drop_path_rate
         if cfg.patch_drop_rate is not None:
             timm_kwargs['patch_drop_rate'] = cfg.patch_drop_rate
+        if cfg.attn_backend is not None:
+            assert self.is_naflex, 'attn_backend is only supported for NaFlexVit encoders.'
+            timm_kwargs['attn_backend'] = cfg.attn_backend
 
         load_from_hub = cfg.pretrained and not cfg.pretrained_from
         if cfg.name == 'naflexvit':

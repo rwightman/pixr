@@ -17,6 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+from .attention import CrossAttnMask, cross_attention, prepare_cross_attn
 from .config import TextDecoderCfg
 
 _logger = logging.getLogger(__name__)
@@ -66,12 +67,15 @@ class Attention(nn.Module):
         if kv is None:
             kv = self.project_kv(x)
         k, v = kv
-        x = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_mask,
-            dropout_p=self.attn_drop if self.training else 0.,
-            is_causal=is_causal and attn_mask is None,
-        )
+        if isinstance(attn_mask, CrossAttnMask):
+            x = cross_attention(q, k, v, attn_mask, dropout_p=self.attn_drop if self.training else 0.)
+        else:
+            x = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=self.attn_drop if self.training else 0.,
+                is_causal=is_causal and attn_mask is None,
+            )
         x = x.transpose(1, 2).reshape(B, N, C)
         return self.out_proj(x)
 
@@ -242,6 +246,11 @@ class TextDecoder(nn.Module):
         self.embed_tokens = new
         self.vocab_size = new_vocab_size
 
+    def prepare_cross(self, encoder_hidden_states: torch.Tensor, encoder_mask: Optional[torch.Tensor] = None):
+        """ Encoder output -> (per-layer cross-attn K / V, cross-attn mask) w/ the configured backend. """
+        states, mask = prepare_cross_attn(encoder_hidden_states, encoder_mask, self.cfg.cross_attn_backend)
+        return self.project_cross_kv(states), mask
+
     def project_cross_kv(self, encoder_hidden_states: torch.Tensor) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         return [layer.encoder_attn.project_kv(encoder_hidden_states) for layer in self.layers]
 
@@ -254,6 +263,7 @@ class TextDecoder(nn.Module):
             position_ids: Optional[torch.Tensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
             cache: Optional[List[Dict[str, torch.Tensor]]] = None,
+            cross_mask: Optional[CrossAttnMask] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -264,6 +274,7 @@ class TextDecoder(nn.Module):
             position_ids: [B, T] position ids, default is arange(past_len, past_len + T)
             attention_mask: [B, past_len + T] bool key validity mask for self-attention (left padded prompts)
             cache: per-layer dicts for self-attention KV caching (generation)
+            cross_mask: cross-attention mask from prepare_cross() (when passing pre-projected `cross_kv`)
 
         Returns:
             logits [B, T, vocab_size]
@@ -280,11 +291,9 @@ class TextDecoder(nn.Module):
 
         if cross_kv is None:
             assert encoder_hidden_states is not None
-            cross_kv = self.project_cross_kv(encoder_hidden_states)
-
-        cross_mask = None
-        if encoder_mask is not None:
-            cross_mask = encoder_mask[:, None, None, :]  # [B, 1, 1, S]
+            cross_kv, cross_mask = self.prepare_cross(encoder_hidden_states, encoder_mask)
+        elif cross_mask is None and encoder_mask is not None:
+            cross_mask = CrossAttnMask('sdpa', encoder_mask.bool())
 
         self_mask = None
         if attention_mask is not None or (past_len > 0 and T > 1):

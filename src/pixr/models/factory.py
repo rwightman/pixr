@@ -14,7 +14,7 @@ _logger = logging.getLogger(__name__)
 _MODEL_TYPES = {
     'cruller': Cruller,
     'fritter': Fritter,
-    'cronut': Cronut,  # placeholder
+    'cronut': Cronut,
 }
 
 
@@ -55,7 +55,8 @@ def load_model_state(model: torch.nn.Module, state_dict, strict: bool = True):
     """ Load model weights, adapting token embedding rows if the vocab grew. """
     state_dict = dict(clean_state_dict(state_dict))
     own = model.state_dict()
-    for key in ('text_decoder.embed_tokens.weight', 'text_decoder.output_bias'):
+    vocab_keys = getattr(model, 'vocab_param_names', ('text_decoder.embed_tokens.weight', 'text_decoder.output_bias'))
+    for key in vocab_keys:
         if key in state_dict and key in own and state_dict[key].shape != own[key].shape:
             src = state_dict[key]
             dst = own[key].clone()

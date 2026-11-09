@@ -3,6 +3,7 @@ from typing import List, Optional, Sequence
 from transformers import AutoTokenizer
 
 from .config import TokenizerCfg
+from .tiktoken_tokenizer import TiktokenTokenizer, TIKTOKEN_PREFIX
 
 
 def create_tokenizer(cfg: TokenizerCfg, added_tokens: Optional[Sequence[str]] = None):
@@ -12,6 +13,11 @@ def create_tokenizer(cfg: TokenizerCfg, added_tokens: Optional[Sequence[str]] = 
     checkpoint's added tokens first, then task tokens, so existing embedding rows line up.
     """
     assert cfg.name
+    if cfg.name.startswith(TIKTOKEN_PREFIX):
+        tokenizer = TiktokenTokenizer(cfg.name[len(TIKTOKEN_PREFIX):])
+        if added_tokens:
+            add_tokens(tokenizer, added_tokens)
+        return tokenizer
     tokenizer = AutoTokenizer.from_pretrained(cfg.name)
     if tokenizer.pad_token is None or tokenizer.pad_token_id == tokenizer.eos_token_id:
         # a pad token distinct from eos is required, padding is excluded from the loss (eos must be learned)
@@ -33,5 +39,7 @@ def add_tokens(tokenizer, tokens: Sequence[str]) -> int:
 def get_added_tokens(tokenizer) -> List[str]:
     """ Tokens added on top of the base vocab, in id order. """
     base_size = tokenizer.vocab_size
+    if isinstance(tokenizer, TiktokenTokenizer):
+        base_size += 3  # eos, pad, bos are part of the base (control) vocab
     added = {i: t for t, i in tokenizer.get_vocab().items() if i >= base_size}
     return [added[i] for i in sorted(added)]

@@ -1,0 +1,34 @@
+{
+    "type": "cronut",
+    "image_encoder": {
+        "name": "cronut",
+        "pretrained": false,
+        "image_fmt": "L",
+        "max_seq_len": 4096,
+        "image_mean": [
+            0.5
+        ],
+        "image_std": [
+            0.5
+        ]
+    },
+    "text_decoder": {
+        "name": "tiktoken:cl100k_base",
+        "pretrained": false,
+        "max_length": 1024
+    },
+    "cronut": {
+        "width": 768,
+        "depth": 12,
+        "num_heads": 12,
+        "intermediate_size": 2048,
+        "text_embed_dim": 768,
+        "patch_size": 16,
+        "mrope_section": [
+            8,
+            12,
+            12
+        ],
+        "attn_backend": "flex"
+    }
+}

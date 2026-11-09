@@ -1,4 +1,4 @@
-from .config import ModelArgs, ModelCfg, ImageEncoderCfg, TextDecoderCfg, get_model_config, list_models
+from .config import ModelArgs, ModelCfg, ImageEncoderCfg, TextDecoderCfg, CronutCfg, get_model_config, list_models
 from .cruller import Cruller
 from .cronut import Cronut
 from .fritter import Fritter, merge_patch_tokens

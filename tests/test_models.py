@@ -185,13 +185,6 @@ def test_checkpoint_vocab_expansion(tmp_path):
 
 
 
-def test_cronut_placeholder():
-    cfg = _tiny_cfg()
-    cfg = ModelCfg(type='cronut', image_encoder=cfg.image_encoder, text_decoder=cfg.text_decoder)
-    with pytest.raises(NotImplementedError):
-        create_model(cfg, vocab_size=100)
-
-
 def test_qwen3_decoder_matches_hf():
     import transformers
     from pixr.models import Qwen3TextDecoder
@@ -214,3 +207,86 @@ def test_qwen3_decoder_matches_hf():
         if l.cross_attn is not None:
             torch.nn.init.normal_(l.cross_attn.out_proj.weight, std=0.02)
     _check_cache_and_padding(xdec, ids, enc, pad_id=151669, atol=5e-2)
+
+
+_DEV = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+
+def _tiny_cronut_cfg(attn_backend='sdpa'):
+    from pixr.models import CronutCfg
+    return ModelCfg(
+        type='cronut',
+        image_encoder=ImageEncoderCfg(name='cronut', pretrained=False, image_fmt='L', max_seq_len=64),
+        text_decoder=TextDecoderCfg(name='tiktoken:cl100k_base', pretrained=False, max_length=64),
+        cronut=CronutCfg(
+            width=64, depth=2, num_heads=2, intermediate_size=96, text_embed_dim=48, patch_size=16,
+            mrope_section=(4, 6, 6), attn_backend=attn_backend),
+    )
+
+
+def test_cronut_greedy_matches_teacher_forced():
+    torch.manual_seed(0)
+    model = create_model(_tiny_cronut_cfg(), vocab_size=100, pad_token_id=1).eval()
+    patches = _patches()
+    prompts = [[5], [6, 7, 8]]
+    out = generate_greedy(model, patches, prompt_ids=prompts, stop_token_ids=[2], pad_token_id=1, max_new_tokens=12)
+    for i, prompt in enumerate(prompts):
+        single = {k: v[i:i + 1] for k, v in patches.items()}
+        seq = torch.tensor([prompt + out[i]])
+        with torch.no_grad():
+            logits = model(single, seq[:, :-1])
+        assert logits[0, len(prompt) - 1:].argmax(-1).tolist() == out[i]
+
+
+def test_cronut_flex_matches_sdpa():
+    torch.manual_seed(0)
+    ref = create_model(_tiny_cronut_cfg('sdpa'), vocab_size=100, pad_token_id=1).to(_DEV).eval()
+    flex = create_model(_tiny_cronut_cfg('flex'), vocab_size=100, pad_token_id=1).to(_DEV).eval()
+    flex.load_state_dict(ref.state_dict())
+    patches = {k: v.to(_DEV) for k, v in _patches().items()}
+    text = torch.randint(3, 100, (2, 9), device=_DEV)
+    with torch.no_grad():
+        a = ref(patches, text)
+        b = flex(patches, text)
+    torch.testing.assert_close(a, b, atol=1e-4, rtol=1e-4)
+
+
+def test_cronut_checkpoint_vocab_expansion(tmp_path):
+    torch.manual_seed(0)
+    model = create_model(_tiny_cronut_cfg(), vocab_size=100, pad_token_id=1)
+    path = tmp_path / 'cronut.pt'
+    torch.save({'model': model.state_dict(), 'model_cfg': model.cfg.to_dict()}, path)
+    cfg = ModelCfg.from_dict(torch.load(path)['model_cfg'])
+    model2 = create_model(cfg, vocab_size=104, pad_token_id=1, pretrained=str(path))
+    assert torch.equal(model2.text_embed.weight[:100], model.text_embed.weight)
+    assert torch.equal(model2.lm_head.weight[:100], model.lm_head.weight)
+
+
+@pytest.mark.parametrize('dec_type', ['ettin', 'qwen3'])
+def test_prefix_lm_flex_matches_sdpa(dec_type):
+    from pixr.models import EttinTextDecoder, Qwen3TextDecoder
+    torch.manual_seed(0)
+    kw = dict(type=dec_type, pretrained=False, num_layers=3, dim=64, num_heads=4, ffn_dim=96, max_length=64,
+              cross_attn_every=0, sliding_window=4, global_attn_every=2, num_kv_heads=2, head_dim=16)
+    cls = EttinTextDecoder if dec_type == 'ettin' else Qwen3TextDecoder
+    ref = cls(TextDecoderCfg(**kw), vocab_size=100, pad_token_id=1).to(_DEV).eval()
+    flex = cls(TextDecoderCfg(**kw, self_attn_backend='flex'), vocab_size=100, pad_token_id=1).to(_DEV).eval()
+    flex.load_state_dict(ref.state_dict())
+    prefix = torch.randn(2, 10, 64, device=_DEV)
+    prefix_mask = torch.ones(2, 10, dtype=torch.bool, device=_DEV)
+    prefix_mask[1, 6:] = False
+    ids = torch.randint(3, 100, (2, 7), device=_DEV)
+    with torch.no_grad():
+        a = ref(ids, prefix_embeds=prefix, prefix_mask=prefix_mask)
+        b = flex(ids, prefix_embeds=prefix, prefix_mask=prefix_mask)
+    torch.testing.assert_close(a, b, atol=1e-4, rtol=1e-4)
+
+
+def test_tiktoken_tokenizer():
+    from pixr.tokenizers import TokenizerCfg, create_tokenizer, get_added_tokens
+    tok = create_tokenizer(TokenizerCfg('tiktoken:cl100k_base'), added_tokens=['<s_pretrain>'])
+    assert tok.pad_token_id != tok.eos_token_id
+    ids = tok('<s_pretrain>Total: $56.78' + tok.eos_token, add_special_tokens=False).input_ids
+    assert ids[0] == tok.convert_tokens_to_ids('<s_pretrain>') and ids[-1] == tok.eos_token_id
+    assert tok.decode(ids, skip_special_tokens=True) == 'Total: $56.78'
+    assert get_added_tokens(tok) == ['<s_pretrain>']

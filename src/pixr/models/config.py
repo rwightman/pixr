@@ -38,6 +38,7 @@ class ImageEncoderCfg(Serializable):
     drop_rate: Optional[float] = None
     drop_path_rate: Optional[float] = None
     patch_drop_rate: Optional[float] = None
+    attn_backend: Optional[str] = None  # NaFlexVit attention backend ('sdpa', 'sdpa_auto', 'varlen', 'flex')
 
     @property
     def is_naflex(self) -> bool:
@@ -62,6 +63,8 @@ class TextDecoderCfg(Serializable):
     num_layers: Optional[int] = 4  # truncate (keep first N) pretrained layers, or set depth if not pretrained
     max_length: int = 1024
     qk_norm_cross: bool = False
+    cross_attn_backend: str = 'sdpa'  # cross-attention over padded encoder tokens: 'sdpa', 'varlen', 'flex'
+    self_attn_backend: str = 'sdpa'  # (prefix-LM / padded) self-attention: 'sdpa' (dense mask), 'flex' (ettin, qwen3)
     # Re-initialize cross-attention (w/ zero init output projection) instead of using pretrained (BART) weights.
     # Pretrained cross-attn weights expect the pretrained text encoder's features and significantly slow learning
     # w/ an image encoder, zero init output projections start the decoder as the pretrained LM.
@@ -84,13 +87,41 @@ class TextDecoderCfg(Serializable):
 
 
 @dataclass
+class CronutCfg(Serializable):
+    """ Cronut (native decoder-only image + text, GenLIP style) trunk config. """
+    width: int = 768
+    depth: int = 12
+    num_heads: int = 12
+    intermediate_size: int = 2048
+    text_embed_dim: int = 768  # token embedding / lm_head dim (projected to / from width)
+    patch_size: int = 16
+    mrope_section: Tuple[int, int, int] = (8, 12, 12)  # T / H / W channel split, sum == head_dim // 2
+    mrope_interleaved: bool = True
+    rope_theta: float = 10000.
+    ls_init_value: Optional[float] = 0.1
+    drop_path_rate: float = 0.
+    gated_attention: bool = True
+    use_swiglu_ffn: bool = True
+    hidden_act: str = 'silu'
+    norm_type: str = 'rmsnorm'  # 'rmsnorm' or 'layernorm'
+    layer_norm_eps: float = 1e-6
+    qk_norm: bool = True
+    attention_bias: bool = False
+    mlp_bias: bool = False
+    patch_input_norm: bool = False  # LayerNorm on raw flattened patches before projection
+    patch_pre_norm: bool = True  # norm on projected patch embeddings (stream scale equalization)
+    text_pre_norm: bool = True  # norm on projected text embeddings
+    attn_backend: str = 'sdpa'  # 'sdpa' (dense prefix-LM mask) or 'flex' (prefix-LM block mask)
+
+
+@dataclass
 class ModelCfg(Serializable):
     """ Model config.
 
     Types:
         'cruller': image encoder + text decoder w/ cross-attention (Donut style)
         'fritter': image encoder + projector -> image token prefix for a decoder-only LM (prefix-LM attention)
-        'cronut': native decoder-only image + text transformer (placeholder, not implemented yet)
+        'cronut': native decoder-only image + text transformer w/ prefix-LM attention (GenLIP style)
     """
     type: str = 'cruller'
     image_encoder: ImageEncoderCfg = field(default_factory=ImageEncoderCfg)
@@ -98,6 +129,7 @@ class ModelCfg(Serializable):
     # fritter (prefix) specific
     prefix_token_merge: int = 1  # merge m x m patch tokens before projection (reduces prefix length by m^2)
     projector_type: str = 'mlp'  # image -> text embedding projector ('mlp', 'linear')
+    cronut: Optional[CronutCfg] = None  # cronut trunk config
 
 
 @dataclass

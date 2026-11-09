@@ -17,6 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+from .attention import CrossAttnMask, prepare_cross_attn, build_prefix_lm_block_mask, self_attention, has_flex
 from .config import TextDecoderCfg
 from .text_decoder import Attention
 from .text_decoder_ettin import apply_rope
@@ -63,10 +64,10 @@ class GqaAttention(nn.Module):
                 k = torch.cat([cache['k'], k], dim=2)
                 v = torch.cat([cache['v'], v], dim=2)
             cache['k'], cache['v'] = k, v
-        x = F.scaled_dot_product_attention(
+        x = self_attention(
             q, k, v,
             attn_mask=attn_mask,
-            is_causal=is_causal and attn_mask is None,
+            is_causal=is_causal,
             enable_gqa=self.num_kv_heads != self.num_heads,
         )
         return self.o_proj(x.transpose(1, 2).reshape(B, T, -1))
@@ -180,6 +181,11 @@ class Qwen3TextDecoder(nn.Module):
     def no_weight_decay(self):
         return {'embed_tokens.weight'}
 
+    def prepare_cross(self, encoder_hidden_states: torch.Tensor, encoder_mask: Optional[torch.Tensor] = None):
+        """ Encoder output -> (per-layer cross-attn K / V, cross-attn mask) w/ the configured backend. """
+        states, mask = prepare_cross_attn(encoder_hidden_states, encoder_mask, self.cfg.cross_attn_backend)
+        return self.project_cross_kv(states), mask
+
     def project_cross_kv(self, encoder_hidden_states: torch.Tensor):
         return [
             layer.cross_attn.project_kv(encoder_hidden_states) if layer.cross_attn is not None else None
@@ -203,6 +209,7 @@ class Qwen3TextDecoder(nn.Module):
             prefix_embeds: Optional[torch.Tensor] = None,
             prefix_mask: Optional[torch.Tensor] = None,
             prefix_len: Optional[int] = None,
+            cross_mask: Optional[CrossAttnMask] = None,
     ) -> torch.Tensor:
         """ Same interface as EttinTextDecoder (prefix-LM and / or cross-attn), returns text position logits. """
         B, T = input_ids.shape
@@ -230,24 +237,35 @@ class Qwen3TextDecoder(nn.Module):
         if self.has_cross_attn:
             if cross_kv is None:
                 assert encoder_hidden_states is not None
-                cross_kv = self.project_cross_kv(encoder_hidden_states)
-            cross_mask = encoder_mask[:, None, None, :] if encoder_mask is not None else None
+                cross_kv, cross_mask = self.prepare_cross(encoder_hidden_states, encoder_mask)
+            elif cross_mask is None and encoder_mask is not None:
+                cross_mask = CrossAttnMask('sdpa', encoder_mask.bool())
         else:
             cross_kv = [None] * len(self.layers)
             cross_mask = None
 
-        q_idx = torch.arange(past_len, S, device=device)[:, None]
-        k_idx = torch.arange(S, device=device)[None, :]
-        allowed = k_idx <= q_idx
-        if P > 0:
-            allowed = allowed | ((q_idx < P) & (k_idx < P))  # bidirectional prefix
-        if attention_mask is not None:
-            key_valid = attention_mask[:, None, None, :S].bool()
-            mask = (allowed[None, None] & key_valid) | (k_idx == q_idx)[None, None]
+        use_flex = (
+            self.cfg.self_attn_backend == 'flex' and has_flex and past_len == 0 and L > 1
+            and (P > 0 or attention_mask is not None)
+        )
+        if use_flex:
+            key_valid = attention_mask[:, :S].bool() if attention_mask is not None else \
+                torch.ones(B, S, dtype=torch.bool, device=device)
+            mask = build_prefix_lm_block_mask(key_valid, P)
+            is_causal = False
         else:
-            simple_causal = P == 0 and (past_len == 0 or L == 1)
-            mask = None if simple_causal else allowed[None, None]
-        is_causal = mask is None and L > 1
+            q_idx = torch.arange(past_len, S, device=device)[:, None]
+            k_idx = torch.arange(S, device=device)[None, :]
+            allowed = k_idx <= q_idx
+            if P > 0:
+                allowed = allowed | ((q_idx < P) & (k_idx < P))  # bidirectional prefix
+            if attention_mask is not None:
+                key_valid = attention_mask[:, None, None, :S].bool()
+                mask = (allowed[None, None] & key_valid) | (k_idx == q_idx)[None, None]
+            else:
+                simple_causal = P == 0 and (past_len == 0 or L == 1)
+                mask = None if simple_causal else allowed[None, None]
+            is_causal = mask is None and L > 1
 
         for i, layer in enumerate(self.layers):
             layer_cache = cache[i] if cache is not None else None
