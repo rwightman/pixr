@@ -38,6 +38,8 @@ dependencies = [
     "chugr",
     "Levenshtein",
     "pyyaml",
+    "jsonargparse",
+    "tiktoken",
 ]
 dynamic = ["version"]
 

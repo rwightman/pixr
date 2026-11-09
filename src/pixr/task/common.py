@@ -2,10 +2,15 @@ import logging
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 
 from chugr.common import ImageFeatureInfo
 from chugr.doc import DEFAULT_DOC_KEY
 
+from pixr.data import create_image_preprocessor, ImagePreprocessorFactory
+from pixr.framework import DeviceEnv, TaskCfg, TrainingTask
+from pixr.framework.task import move_to_device
+from pixr.generation import generate_greedy
 from pixr.models import ModelArgs, ModelCfg, Cruller, create_model, load_model_state
 from pixr.tokenizers import TokenizerCfg, create_tokenizer, get_added_tokens
 from pixr.utils import load_checkpoint
@@ -72,3 +77,67 @@ def trim_padding(text_input: torch.Tensor, text_target: torch.Tensor, pad_token_
     """ Trim batch sequence length to the longest non-pad sequence. """
     max_len = int((text_input != pad_token_id).sum(1).max().item())
     return text_input[:, :max_len], text_target[:, :max_len]
+
+
+class ImageTextTask(TrainingTask):
+    """ Base for image -> text tasks, agnostic to the model family (Cruller, Fritter, Cronut).
+
+    Models implement: forward(image_input, text_input) -> text logits, prefill() / step() for generation,
+    image_encoder.input_info (image preprocessing requirements), cfg, no_weight_decay(), set_grad_checkpointing().
+    """
+    task_tokens: Sequence[str] = ()
+
+    def __init__(self, cfg: TaskCfg, device_env: DeviceEnv, checkpoint_path: str = ''):
+        model, tokenizer = init_model_and_tokenizer(
+            cfg.model,
+            cfg.tokenizer,
+            task_tokens=self.task_tokens,
+            checkpoint_path=checkpoint_path,
+        )
+        super().__init__(cfg, model, device_env)
+        self.tokenizer = tokenizer
+        self.pad_token_id = tokenizer.pad_token_id
+        self.input_info = model.image_encoder.input_info
+        self.image_preprocess_train = create_image_preprocessor(
+            self.input_info, is_training=True, transform_type=cfg.image_transforms)
+        self.image_preprocess_eval = create_image_preprocessor(
+            self.input_info, is_training=False, transform_type=cfg.image_transforms)
+        self.image_preprocess_factory = ImagePreprocessorFactory(self.input_info, True, cfg.image_transforms)
+
+    def extra_state(self) -> Dict[str, Any]:
+        return checkpoint_extra_state(self.trainable_module, self.tokenizer, self.task_name)
+
+    def lm_loss(self, batch: Dict[str, Any]):
+        """ Teacher forced next token cross-entropy on text targets (masked w/ -100). """
+        text_input, text_target = trim_padding(batch['text_input'], batch['text_target'], self.pad_token_id)
+        logits = self.trainable_module(batch['image_input'], text_input[:, :-1])
+        loss = F.cross_entropy(
+            logits.flatten(0, 1),
+            text_target[:, 1:].flatten(),
+            ignore_index=-100,
+            label_smoothing=self.cfg.label_smoothing,
+        )
+        return logits, loss
+
+    def training_forward(self, batch: Dict[str, Any]):
+        logits, loss = self.lm_loss(batch)
+        return {'logits': logits}, {'loss': loss}
+
+    @torch.no_grad()
+    def generate(self, image_input, prompts: Sequence[Sequence[int]], stop_token_ids, max_new_tokens: int,
+                 use_ema: bool = False):
+        model = self.get_trainable_module(use_ema)
+        was_training = model.training
+        model.eval()
+        with self.autocast():
+            out = generate_greedy(
+                model,
+                move_to_device(image_input, self.device),
+                prompt_ids=prompts,
+                stop_token_ids=stop_token_ids,
+                pad_token_id=self.pad_token_id,
+                max_new_tokens=max_new_tokens,
+            )
+        if was_training:
+            model.train()
+        return out

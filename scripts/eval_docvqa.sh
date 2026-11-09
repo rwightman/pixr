@@ -7,7 +7,7 @@ SPLIT=${SPLIT:-validation}
 NUM_GPUS=${NUM_GPUS:-1}
 
 python -m torch.distributed.run --nproc_per_node "${NUM_GPUS}" -m pixr.app.eval \
-  --task cruller_eval_docvqa \
+  --task docvqa \
   --checkpoint-path "${CHECKPOINT}" \
   --eval-data.source pixparse/docvqa-single-page-questions \
   --eval-data.split "${SPLIT}" \

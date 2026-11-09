@@ -7,3 +7,5 @@ chugr
 Levenshtein
 pyyaml
 fsspec
+jsonargparse
+tiktoken

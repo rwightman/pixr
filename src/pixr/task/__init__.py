@@ -1,5 +1,4 @@
-from .task_cruller_pretrain import TaskCrullerPretrain, TaskCrullerPretrainCfg
-from .task_cruller_finetune_docvqa import TaskCrullerFinetuneDocVqa, TaskCrullerFinetuneDocVqaCfg
-from .task_cruller_eval_ocr import TaskCrullerEvalOcr, TaskCrullerEvalOcrCfg
-from .task_cruller_eval_docvqa import TaskCrullerEvalDocVqa, TaskCrullerEvalDocVqaCfg
-from .task_registry import get_train_task, get_train_task_cfgs, get_eval_task, get_eval_task_cfgs
+from .common import ImageTextTask, init_model_and_tokenizer
+from .docvqa import DocVqaTask, DocVqaTaskCfg
+from .read import ReadTask, ReadTaskCfg
+from .task_registry import TASK_REGISTRY, get_task, get_task_cfgs, get_task_name

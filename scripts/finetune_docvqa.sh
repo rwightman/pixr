@@ -17,7 +17,7 @@ MAX_SEQ_LEN=${MAX_SEQ_LEN:-4096}
 EXPERIMENT=${EXPERIMENT:-finetune_docvqa}
 
 python -m torch.distributed.run --nproc_per_node "${NUM_GPUS}" -m pixr.app.train \
-  --task cruller_finetune_docvqa \
+  --task docvqa \
   --checkpoint-path "${CHECKPOINT}" \
   --task.model.max-seq-len "${MAX_SEQ_LEN}" \
   --train-data.source pixparse/docvqa-single-page-questions \
@@ -30,11 +30,11 @@ python -m torch.distributed.run --nproc_per_node "${NUM_GPUS}" -m pixr.app.train
   --eval-data.format hfds \
   --eval-data.batch-size 32 \
   --eval-data.num-workers 8 \
-  --task.num-intervals "${NUM_INTERVALS}" \
-  --task.num-warmup-intervals 1 \
-  --task.opt.learning-rate "${LR}" \
-  --task.opt.grad-accum-steps "${ACCUM}" \
-  --task.log-frequency 50 \
+  --trainer.num-intervals "${NUM_INTERVALS}" \
+  --trainer.num-warmup-intervals 1 \
+  --trainer.opt.learning-rate "${LR}" \
+  --trainer.opt.grad-accum-steps "${ACCUM}" \
+  --trainer.log-frequency 50 \
   --eval-frequency 2 \
   --experiment "${EXPERIMENT}" \
   --resume latest \

@@ -7,7 +7,7 @@ NUM_SAMPLES=${NUM_SAMPLES:-500}
 SOURCE=${SOURCE:-"pipe:curl -s -f -L https://huggingface.co/datasets/pixparse/idl-wds/resolve/main/idl-train-00000.tar"}
 
 python -m pixr.app.eval \
-  --task cruller_eval_ocr \
+  --task read \
   --checkpoint-path "${CHECKPOINT}" \
   --eval-data.source "${SOURCE}" \
   --eval-data.num-samples "${NUM_SAMPLES}" \

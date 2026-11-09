@@ -9,7 +9,7 @@
 set -euo pipefail
 
 NUM_GPUS=${NUM_GPUS:-2}
-MODEL=${MODEL:-cruller_naflex_clip_base}
+MODEL=${MODEL:-cruller_naflex_siglip2_base}
 BATCH_SIZE=${BATCH_SIZE:-16}  # per GPU
 ACCUM=${ACCUM:-4}  # global batch = NUM_GPUS * BATCH_SIZE * ACCUM
 NUM_INTERVALS=${NUM_INTERVALS:-40}
@@ -21,20 +21,20 @@ IDL_SOURCE=${IDL_SOURCE:-"pipe:${CURL} https://huggingface.co/datasets/pixparse/
 EXPERIMENT=${EXPERIMENT:-pretrain_${MODEL}_idl}
 
 python -m torch.distributed.run --nproc_per_node "${NUM_GPUS}" -m pixr.app.train \
-  --task cruller_pretrain \
+  --task read \
   --task.model.name "${MODEL}" \
   --train-data.source "${IDL_SOURCE}" \
   --train-data.resampled true \
   --train-data.num-samples "${SAMPLES_PER_INTERVAL}" \
   --train-data.batch-size "${BATCH_SIZE}" \
   --train-data.num-workers "${WORKERS}" \
-  --task.num-intervals "${NUM_INTERVALS}" \
-  --task.num-warmup-intervals 1 \
-  --task.opt.learning-rate "${LR}" \
-  --task.opt.grad-accum-steps "${ACCUM}" \
-  --task.opt.weight-decay 0.05 \
-  --task.log-frequency 50 \
-  --task.metrics-frequency 1000 \
+  --trainer.num-intervals "${NUM_INTERVALS}" \
+  --trainer.num-warmup-intervals 1 \
+  --trainer.opt.learning-rate "${LR}" \
+  --trainer.opt.grad-accum-steps "${ACCUM}" \
+  --trainer.opt.weight-decay 0.05 \
+  --trainer.log-frequency 50 \
+  --trainer.metrics-frequency 1000 \
   --experiment "${EXPERIMENT}" \
   --resume latest \
   --tensorboard true \
