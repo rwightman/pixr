@@ -1,8 +1,11 @@
 """ Qwen3 style decoder-only LM (prefix-LM capable)
 
 Pre-norm transformer w/ RMSNorm, GQA attention w/ per-head q/k RMSNorm, SwiGLU MLP, RoPE. Weights are loaded from
-Hugging Face Qwen3 checkpoints (e.g. Qwen/Qwen3-0.6B-Base) by name. Cross-attention is not supported, used as the
-LM for prefix (Fritter) models.
+Hugging Face Qwen3 checkpoints (e.g. Qwen/Qwen3-0.6B-Base) by name.
+
+Used as a prefix LM (Fritter), or w/ optional cross-attention (Cruller): a pre-norm cross-attention sub-block w/ zero
+init output projection is inserted after self-attention in every `cross_attn_every` layers (Flamingo / Llama 3.2
+Vision style), so the decoder starts as the pretrained LM.
 """
 import json
 import logging
@@ -15,6 +18,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .config import TextDecoderCfg
+from .text_decoder import Attention
 from .text_decoder_ettin import apply_rope
 
 _logger = logging.getLogger(__name__)
@@ -80,15 +84,24 @@ class SwiGLU(nn.Module):
 
 
 class Qwen3Layer(nn.Module):
-    def __init__(self, dim, num_heads, num_kv_heads, head_dim, ffn_dim, eps=1e-6):
+    def __init__(self, dim, num_heads, num_kv_heads, head_dim, ffn_dim, eps=1e-6, has_cross_attn=False,
+                 qk_norm_cross=False):
         super().__init__()
         self.input_layernorm = RMSNorm(dim, eps=eps)
         self.self_attn = GqaAttention(dim, num_heads, num_kv_heads, head_dim, eps=eps)
+        if has_cross_attn:
+            self.cross_attn_norm = RMSNorm(dim, eps=eps)
+            self.cross_attn = Attention(dim, num_heads, qk_norm=qk_norm_cross)
+        else:
+            self.cross_attn_norm = None
+            self.cross_attn = None
         self.post_attention_layernorm = RMSNorm(dim, eps=eps)
         self.mlp = SwiGLU(dim, ffn_dim)
 
-    def forward(self, x, rope, mask=None, is_causal=False, cache=None):
+    def forward(self, x, rope, mask=None, is_causal=False, cache=None, cross_kv=None, cross_mask=None):
         x = x + self.self_attn(self.input_layernorm(x), rope, attn_mask=mask, is_causal=is_causal, cache=cache)
+        if self.cross_attn is not None:
+            x = x + self.cross_attn(self.cross_attn_norm(x), kv=cross_kv, attn_mask=cross_mask)
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
@@ -99,7 +112,6 @@ class Qwen3TextDecoder(nn.Module):
         self.vocab_size = vocab_size
         self.pad_token_id = pad_token_id
         self.grad_checkpointing = False
-        assert cfg.cross_attn_every <= 0, 'Qwen3 decoder does not support cross-attention, use as a prefix LM.'
 
         pretrained_state = None
         if cfg.pretrained:
@@ -107,14 +119,20 @@ class Qwen3TextDecoder(nn.Module):
         self.cfg = cfg
         self.dim = cfg.dim
         self.max_length = cfg.max_length
-        self.has_cross_attn = False
+        cross_every = cfg.cross_attn_every
+        self.has_cross_attn = cross_every > 0
         head_dim = cfg.head_dim or cfg.dim // cfg.num_heads
         num_kv_heads = cfg.num_kv_heads or cfg.num_heads
 
         self.embed_tokens = nn.Embedding(vocab_size, cfg.dim)
         self.layers = nn.ModuleList([
-            Qwen3Layer(cfg.dim, cfg.num_heads, num_kv_heads, head_dim, cfg.ffn_dim, eps=cfg.norm_eps)
-            for _ in range(cfg.num_layers)
+            Qwen3Layer(
+                cfg.dim, cfg.num_heads, num_kv_heads, head_dim, cfg.ffn_dim,
+                eps=cfg.norm_eps,
+                has_cross_attn=cross_every > 0 and i % cross_every == cross_every - 1,
+                qk_norm_cross=cfg.qk_norm_cross,
+            )
+            for i in range(cfg.num_layers)
         ])
         self.norm = RMSNorm(cfg.dim, eps=cfg.norm_eps)
         inv_freq = 1.0 / (cfg.rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float) / head_dim))
@@ -128,6 +146,11 @@ class Qwen3TextDecoder(nn.Module):
         for m in self.modules():
             if isinstance(m, (nn.Linear, nn.Embedding)):
                 nn.init.normal_(m.weight, std=0.02)
+                if isinstance(m, nn.Linear) and m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        for layer in self.layers:
+            if layer.cross_attn is not None:
+                nn.init.zeros_(layer.cross_attn.out_proj.weight)
 
     @torch.no_grad()
     def _load_pretrained(self, state_dict: Dict[str, torch.Tensor]):
@@ -157,8 +180,11 @@ class Qwen3TextDecoder(nn.Module):
     def no_weight_decay(self):
         return {'embed_tokens.weight'}
 
-    def project_cross_kv(self, encoder_hidden_states):
-        return [None] * len(self.layers)
+    def project_cross_kv(self, encoder_hidden_states: torch.Tensor):
+        return [
+            layer.cross_attn.project_kv(encoder_hidden_states) if layer.cross_attn is not None else None
+            for layer in self.layers
+        ]
 
     def _rope(self, position_ids: torch.Tensor):
         freqs = position_ids[..., None].float() * self.inv_freq
@@ -178,7 +204,7 @@ class Qwen3TextDecoder(nn.Module):
             prefix_mask: Optional[torch.Tensor] = None,
             prefix_len: Optional[int] = None,
     ) -> torch.Tensor:
-        """ Same interface as EttinTextDecoder (prefix-LM), returns logits for the text positions only. """
+        """ Same interface as EttinTextDecoder (prefix-LM and / or cross-attn), returns text position logits. """
         B, T = input_ids.shape
         device = input_ids.device
         past_len = cache[0]['k'].shape[2] if cache is not None and 'k' in cache[0] else 0
@@ -201,6 +227,15 @@ class Qwen3TextDecoder(nn.Module):
                 position_ids = torch.arange(past_len, S, device=device).unsqueeze(0).expand(B, -1)
         rope = self._rope(position_ids)
 
+        if self.has_cross_attn:
+            if cross_kv is None:
+                assert encoder_hidden_states is not None
+                cross_kv = self.project_cross_kv(encoder_hidden_states)
+            cross_mask = encoder_mask[:, None, None, :] if encoder_mask is not None else None
+        else:
+            cross_kv = [None] * len(self.layers)
+            cross_mask = None
+
         q_idx = torch.arange(past_len, S, device=device)[:, None]
         k_idx = torch.arange(S, device=device)[None, :]
         allowed = k_idx <= q_idx
@@ -217,9 +252,9 @@ class Qwen3TextDecoder(nn.Module):
         for i, layer in enumerate(self.layers):
             layer_cache = cache[i] if cache is not None else None
             if self.grad_checkpointing and self.training and layer_cache is None:
-                x = checkpoint(layer, x, rope, mask, is_causal, None, use_reentrant=False)
+                x = checkpoint(layer, x, rope, mask, is_causal, None, cross_kv[i], cross_mask, use_reentrant=False)
             else:
-                x = layer(x, rope, mask, is_causal, layer_cache)
+                x = layer(x, rope, mask, is_causal, layer_cache, cross_kv[i], cross_mask)
 
         x = self.norm(x[:, P:])
         return F.linear(x, self.embed_tokens.weight)

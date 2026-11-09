@@ -1,4 +1,6 @@
 """ Model tests. NOTE: downloads pretrained weights from the HF hub on first run. """
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -202,3 +204,13 @@ def test_qwen3_decoder_matches_hf():
         a = hf(input_ids=ids).logits
         b = dec(ids)
     assert torch.allclose(a, b, atol=1e-3)
+    # w/ (zero init) cross-attn the decoder still matches the pretrained LM, and cache / padding paths are consistent
+    xdec = Qwen3TextDecoder(replace(cfg, cross_attn_every=2), vocab_size=151936, pad_token_id=151669).eval()
+    enc = torch.randn(2, 30, 1024)
+    with torch.no_grad():
+        c = xdec(ids, encoder_hidden_states=enc)
+    assert torch.allclose(a, c, atol=1e-3)
+    for l in xdec.layers:
+        if l.cross_attn is not None:
+            torch.nn.init.normal_(l.cross_attn.out_proj.weight, std=0.02)
+    _check_cache_and_padding(xdec, ids, enc, pad_id=151669, atol=5e-2)
