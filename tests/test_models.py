@@ -220,7 +220,7 @@ def _tiny_cronut_cfg(attn_backend='sdpa'):
         text_decoder=TextDecoderCfg(name='tiktoken:cl100k_base', pretrained=False, max_length=64),
         cronut=CronutCfg(
             width=64, depth=2, num_heads=2, intermediate_size=96, text_embed_dim=48, patch_size=16,
-            mrope_section=(4, 6, 6), attn_backend=attn_backend),
+            mrope_section=(6, 5, 5), attn_backend=attn_backend),
     )
 
 

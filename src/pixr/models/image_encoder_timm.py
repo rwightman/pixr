@@ -15,31 +15,6 @@ from .config import ImageEncoderCfg
 _logger = logging.getLogger(__name__)
 
 
-def _adapt_naflex_linear_embed(model: nn.Module, in_chans: int):
-    """ Adapt a NaFlexVit linear patch embedding (channels-last flattened patches) from RGB to `in_chans`.
-
-    NOTE timm's pretrained loading can't convert linear patch embed weights and falls back to random init.
-    """
-    proj = model.embeds.proj
-    assert isinstance(proj, nn.Linear)
-    in_features = proj.in_features
-    assert in_features % 3 == 0
-    num_pixels = in_features // 3
-    w = proj.weight.data.reshape(proj.out_features, num_pixels, 3)  # (ph * pw, C) channels-last layout
-    if in_chans == 1:
-        w = w.sum(-1)
-    else:
-        raise ValueError(f'Unsupported in_chans {in_chans} for NaFlex linear embed adaptation.')
-    new_proj = nn.Linear(num_pixels * in_chans, proj.out_features, bias=proj.bias is not None)
-    with torch.no_grad():
-        new_proj.weight.copy_(w.reshape(proj.out_features, -1))
-        if proj.bias is not None:
-            new_proj.bias.copy_(proj.bias)
-    model.embeds.proj = new_proj
-    if hasattr(model.embeds, 'in_chans'):
-        model.embeds.in_chans = in_chans
-
-
 def _load_pretrained_from(model: nn.Module, source_name: str, in_chans: int):
     """ Initialize `model` from the pretrained weights of a different timm model.
 
@@ -92,19 +67,16 @@ class ImageEncoderTimm(nn.Module):
             naflex_cfg = NaFlexVitCfg(**{**timm_kwargs, 'global_pool': ''})
             self.trunk = NaFlexVit(cfg=naflex_cfg, in_chans=in_chans, num_classes=0)
         else:
-            # NaFlex linear patch embeds can't be channel adapted by timm on load, adapt after loading as RGB
-            adapt_naflex = self.is_naflex and load_from_hub and in_chans != 3
             # create w/ default pooling so pretrained weights load strictly, then remove pooling & classifier
+            # NOTE timm adapts pretrained (conv or NaFlex linear) patch embed weights to in_chans on load
             self.trunk = timm.create_model(
                 cfg.name,
                 pretrained=load_from_hub,
-                in_chans=3 if adapt_naflex else in_chans,
+                in_chans=in_chans,
                 num_classes=0,
                 **timm_kwargs
             )
             self.trunk.reset_classifier(0, global_pool='')
-            if adapt_naflex:
-                _adapt_naflex_linear_embed(self.trunk, in_chans)
         pretrained_cfg = getattr(self.trunk, 'pretrained_cfg', {})
         if cfg.pretrained and cfg.pretrained_from:
             pretrained_cfg = _load_pretrained_from(self.trunk, cfg.pretrained_from, in_chans)

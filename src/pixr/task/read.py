@@ -3,7 +3,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 import chugr
 from chugr.doc import SynthTextCfg
@@ -75,7 +75,7 @@ class ReadTask(ImageTextTask):
         return [self.tokenizer.convert_tokens_to_ids([self.task_start_token])] * n
 
     def train_metrics(self, batch: Dict[str, Any], outputs: Dict[str, Any]):
-        """ Greedy decode a few train samples, CER / WER vs the same number of target tokens. """
+        """ Greedy decode a few train samples, CER / WER vs the targets (both capped at metrics_max_new_tokens). """
         n = min(self.cfg.num_metrics_samples, batch['text_input'].shape[0])
         image_input = batch['image_input']
         image_input = {k: v[:n] for k, v in image_input.items()} if isinstance(image_input, dict) else image_input[:n]
@@ -83,29 +83,44 @@ class ReadTask(ImageTextTask):
             image_input, self._prompts(n), [self.tokenizer.eos_token_id], self.cfg.metrics_max_new_tokens)
         predictions = self.tokenizer.batch_decode(generated, skip_special_tokens=True)
         targets = []
-        for t, g in zip(batch['text_input'][:n], generated):
+        for t in batch['text_input'][:n]:
             t = t[t != self.pad_token_id][1:]  # drop start token
-            targets.append(self.tokenizer.decode(t[:max(len(g), 1)], skip_special_tokens=True))
+            # NOTE not truncated to the generated length, an early EOS must count against the prediction
+            targets.append(self.tokenizer.decode(t[:self.cfg.metrics_max_new_tokens], skip_special_tokens=True))
         rates = text_error_rates(predictions, targets)
         _logger.info(f'Sample prediction: {predictions[0][:300]!r}')
         _logger.info(f'Sample target:     {targets[0][:300]!r}')
         return {'train_cer': rates['cer'], 'train_wer': rates['wer']}, {'prediction': predictions[0], 'target': targets[0]}
 
+    def _truncate_reference(self, text: str) -> Tuple[str, bool]:
+        """ Cap the reference at the eval generation budget (eval_max_new_tokens). Pages w/ longer transcriptions
+        can't be fully predicted, w/o the cap their CER is inflated by the unreachable tail. """
+        ids = self.tokenizer(text, add_special_tokens=False).input_ids
+        if len(ids) <= self.cfg.eval_max_new_tokens:
+            return text, False
+        return self.tokenizer.decode(ids[:self.cfg.eval_max_new_tokens], skip_special_tokens=True), True
+
     def evaluate(self, loader, use_ema: bool = False) -> Dict[str, Any]:
         predictions, references = [], []
+        num_truncated = 0
         for batch in loader:
             texts = batch['text_input']
             generated = self.generate(
                 batch['image_input'], self._prompts(len(texts)), [self.tokenizer.eos_token_id],
                 self.cfg.eval_max_new_tokens, use_ema=use_ema)
             predictions.extend(self.tokenizer.batch_decode(generated, skip_special_tokens=True))
-            references.extend([t[0] if isinstance(t, (list, tuple)) else t for t in texts])
+            for t in texts:
+                ref, truncated = self._truncate_reference(t[0] if isinstance(t, (list, tuple)) else t)
+                references.append(ref)
+                num_truncated += truncated
         if self.device_env.world_size > 1:
             predictions = [p for r in self.device_env.all_gather_object(predictions) for p in r]
             references = [p for r in self.device_env.all_gather_object(references) for p in r]
+            num_truncated = sum(self.device_env.all_gather_object(num_truncated))
         self.results = [{'prediction': p, 'reference': r} for p, r in zip(predictions, references)]
         metrics = text_error_rates(predictions, references)
         metrics['num_samples'] = len(predictions)
+        metrics['truncated_refs'] = num_truncated / max(len(references), 1)  # fraction of capped references
         return metrics
 
     def save_results(self, output_dir: str, name: str = 'read'):

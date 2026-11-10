@@ -102,13 +102,19 @@ def main(argv=None):
         resume = get_latest_checkpoint(checkpoint_dir) if os.path.isdir(checkpoint_dir) else ''
         resume = resume or ''
     log_path = None
+    exists = False
     if device_env.is_primary():
-        os.makedirs(checkpoint_dir, exist_ok=True)
         log_path = os.path.join(experiment_path, train_cfg.log_filename)
-        if os.path.exists(log_path) and not resume:
+        exists = os.path.exists(log_path) and not resume
+        if exists:
             print(f"Experiment {train_cfg.experiment} already exists, set --resume or a new --experiment.")
-            return -1
-        train_cfg.save(os.path.join(experiment_path, 'config.yaml'))
+        else:
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            train_cfg.save(os.path.join(experiment_path, 'config.yaml'))
+    if device_env.world_size > 1:
+        exists = device_env.broadcast_object(exists)  # all ranks exit together
+    if exists:
+        return -1
 
     setup_logging(log_path if device_env.is_primary() else None)
     if not device_env.is_primary():

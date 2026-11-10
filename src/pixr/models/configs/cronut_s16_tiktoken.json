@@ -25,9 +25,9 @@
         "text_embed_dim": 512,
         "patch_size": 16,
         "mrope_section": [
-            8,
-            12,
-            12
+            11,
+            11,
+            10
         ],
         "attn_backend": "flex"
     }

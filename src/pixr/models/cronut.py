@@ -12,6 +12,7 @@ text. Follows the open_clip NaFlex GenLIP modelling:
 Attention backends: 'sdpa' (dense prefix-LM bool mask) or 'flex' (FlexAttention prefix-LM block mask).
 Same training forward and prefill() / step() generation interface as Cruller and Fritter.
 """
+import logging
 from dataclasses import replace
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -25,6 +26,8 @@ from timm.layers import DropPath
 from .attention import build_prefix_lm_block_mask, self_attention, has_flex
 from .config import CronutCfg, ImageEncoderCfg, ModelCfg
 from .param_groups import block_modules, decoder_layer_map
+
+_logger = logging.getLogger(__name__)
 
 _ACT = {'silu': F.silu, 'gelu': F.gelu}
 
@@ -48,14 +51,25 @@ class MRoPE(nn.Module):
         super().__init__()
         assert sum(mrope_section) == head_dim // 2, \
             f'sum(mrope_section)={sum(mrope_section)} must equal head_dim // 2 = {head_dim // 2}'
+        if interleaved:
+            # H / W take every 3rd frequency from offsets 1 / 2 (up to 3 * section), T the rest, the sections
+            # must fit within head_dim // 2 frequencies for the split to be what's configured
+            applied = [len(range(axis, min(mrope_section[axis] * 3, head_dim // 2), 3)) for axis in (1, 2)]
+            applied = (head_dim // 2 - sum(applied), *applied)
+            if applied != tuple(mrope_section):
+                # NOTE warn (not fail) so checkpoints w/ the old (8, 12, 12) default (applied as (11, 11, 10)) load
+                _logger.warning(
+                    f'Interleaved mrope_section {tuple(mrope_section)} applies a T / H / W split of {applied} '
+                    f'w/ head_dim {head_dim}, set mrope_section={applied}.')
+            mrope_section = applied
         self.mrope_section = tuple(mrope_section)
         self.interleaved = interleaved
         inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.float) / head_dim))
         self.register_buffer('inv_freq', inv_freq, persistent=False)
 
     @torch.no_grad()
-    def forward(self, position_ids: torch.Tensor, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
-        """ position_ids [3, B, S] -> cos / sin [B, 1, S, head_dim] """
+    def forward(self, position_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """ position_ids [3, B, S] -> float32 cos / sin [B, 1, S, head_dim] """
         freqs = position_ids[..., None].float() * self.inv_freq.float()  # 3, B, S, head_dim // 2
         if self.interleaved:
             f = freqs[0].clone()
@@ -66,7 +80,14 @@ class MRoPE(nn.Module):
         else:
             freqs = freqs[0]
         emb = torch.cat((freqs, freqs), dim=-1)
-        return emb.cos()[:, None].to(dtype), emb.sin()[:, None].to(dtype)
+        return emb.cos()[:, None], emb.sin()[:, None]
+
+
+def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    # rotate in float32 (bf16 activations under autocast / FSDP mixed precision)
+    dtype = x.dtype
+    x = x.float()
+    return (x * cos + rotate_half(x) * sin).to(dtype)
 
 
 class CronutAttention(nn.Module):
@@ -94,8 +115,7 @@ class CronutAttention(nn.Module):
         k = self.k_proj(x).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
         q, k = self.q_norm(q), self.k_norm(k)
-        q = (q * cos + rotate_half(q) * sin).to(v.dtype)
-        k = (k * cos + rotate_half(k) * sin).to(v.dtype)
+        q, k = apply_rope(q, cos, sin).to(v.dtype), apply_rope(k, cos, sin).to(v.dtype)
         if cache is not None:
             if 'k' in cache:
                 k = torch.cat([cache['k'], k], dim=2)
@@ -302,7 +322,7 @@ class Cronut(nn.Module):
         P = img.shape[1]
         txt_pos = text_start[:, None] + (text_mask.long().cumsum(1) - 1).clamp(min=0)  # B, T
         pos = torch.cat([img_pos, txt_pos[None].expand(3, -1, -1)], dim=2)
-        cos, sin = self.rotary(pos, x.dtype)
+        cos, sin = self.rotary(pos)
         key_valid = torch.cat([patch_valid, text_mask.bool()], dim=1)
         x = self._run(x, cos, sin, self._attn_mask(key_valid, P, x), cache=cache)
         x = x[:, P:]
@@ -331,7 +351,7 @@ class Cronut(nn.Module):
         state['key_valid'] = torch.cat([state['key_valid'], state['key_valid'].new_ones(token_ids.shape)], dim=1)
         x = self.embed_text(token_ids)
         pos = state['pos'][None, :, None].expand(3, -1, 1)
-        cos, sin = self.rotary(pos, x.dtype)
+        cos, sin = self.rotary(pos)
         attn_mask = state['key_valid'][:, None, None, :]
         x = self._run(x, cos, sin, attn_mask, cache=state['cache'])
         return self._logits(x)[:, -1], state

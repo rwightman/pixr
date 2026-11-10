@@ -78,8 +78,9 @@ class DocVqaTask(ImageTextTask):
                 })
         if self.device_env.world_size > 1:
             merged = {}
-            for r in [r for rank in self.device_env.all_gather_object(results) for r in rank]:
-                merged.setdefault(r['questionId'], r)  # de-dupe samples padded by the distributed sampler
+            for i, r in enumerate([r for rank in self.device_env.all_gather_object(results) for r in rank]):
+                # de-dupe samples padded by the (HF dataset) distributed sampler, samples w/o ids are kept
+                merged.setdefault(r['questionId'] if r['questionId'] is not None else ('_no_id', i), r)
             results = list(merged.values())
         self.results = results
         scored = [r['anls'] for r in results if r['anls'] is not None]

@@ -1,6 +1,7 @@
 """ Trainer: optimization loop for a TrainingTask (optimizer, schedule, AMP, accumulation, DDP / compile, EMA,
 logging, and train state checkpointing). """
 import logging
+import math
 import re
 import time
 from contextlib import nullcontext
@@ -142,7 +143,9 @@ class Trainer:
             assert not self.task.fsdp_enabled, 'FSDP w/ float16 is not supported, use bfloat16.'
             self.scaler = timm.utils.NativeScaler()
 
-        self.num_steps_per_interval = num_batches_per_interval // opt_cfg.grad_accum_steps
+        self.num_batches_per_interval = num_batches_per_interval
+        # a trailing partial accumulation group still updates (w/ fewer micro batches), as in timm train
+        self.num_steps_per_interval = math.ceil(num_batches_per_interval / opt_cfg.grad_accum_steps)
         warmup_steps = int(self.cfg.num_warmup_intervals * self.num_steps_per_interval)
         # schedule in steps (updates_per_epoch=1) so fractional warmup intervals are supported
         self.scheduler, _ = create_scheduler_v2(
@@ -259,12 +262,19 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
         start = time.time()
         num_samples = 0
+        # the last accumulation group of the interval may be partial (num batches not divisible by accum)
+        num_batches = self.num_batches_per_interval
+        last_accum = num_batches % accum or accum
+        last_group_start = num_batches - last_accum
+        pending = 0
         for interval_batch_idx, batch in enumerate(loader):
             batch = self.task.prepare_batch(batch)
             batch_size = self.task.batch_size(batch) * self.device_env.world_size
             num_samples += batch_size
             self._rate_samples += batch_size
-            need_update = (interval_batch_idx + 1) % accum == 0
+            in_last_group = last_group_start <= interval_batch_idx < num_batches
+            group_accum = last_accum if in_last_group else accum
+            need_update = (interval_batch_idx + 1) % accum == 0 or interval_batch_idx + 1 == num_batches
             # disable gradient sync for all but the last accumulation step, FSDP2: set_requires_gradient_sync,
             # DDP: no_sync context manager
             if not need_update:
@@ -274,19 +284,26 @@ class Trainer:
                 with self.task.autocast():
                     outputs, losses = self.task(batch)
                 loss = losses['loss'] * self._loss_scale(batch)
-                if accum > 1:
-                    loss = loss / accum
+                if group_accum > 1:
+                    loss = loss / group_accum
                 self._backward(loss, need_update)
             if not need_update:
                 self.task.set_requires_gradient_sync(True)
             self.batch_idx += 1
             if not need_update:
+                pending += 1
                 continue
+            pending = 0
             self.step_idx += 1
             self.scheduler.step_update(self.step_idx)
             self.optimizer.zero_grad(set_to_none=True)
             self.task.update_ema()
             self._after_step(batch, outputs, losses)
+        if pending:
+            _logger.warning(
+                f'Loader ended w/ {pending} accumulated batches w/o an update, '
+                f'expected {num_batches} batches per interval.')
+            self.optimizer.zero_grad(set_to_none=True)
         self.interval_idx += 1
         if self.monitor is not None:
             self.monitor.log_phase('train', self.interval_idx - 1)

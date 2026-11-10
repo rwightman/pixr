@@ -95,7 +95,9 @@ class CronutCfg(Serializable):
     intermediate_size: int = 2048
     text_embed_dim: int = 768  # token embedding / lm_head dim (projected to / from width)
     patch_size: int = 16
-    mrope_section: Tuple[int, int, int] = (8, 12, 12)  # T / H / W channel split, sum == head_dim // 2
+    # T / H / W frequency split, sum == head_dim // 2, interleaved H / W must fit (3 * section <= head_dim // 2 + axis)
+    # NOTE (11, 11, 10) is the split the previous (8, 12, 12) default actually applied w/ head_dim 64
+    mrope_section: Tuple[int, int, int] = (11, 11, 10)
     mrope_interleaved: bool = True
     rope_theta: float = 10000.
     ls_init_value: Optional[float] = 0.1
