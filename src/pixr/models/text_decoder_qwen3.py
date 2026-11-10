@@ -241,7 +241,10 @@ class Qwen3TextDecoder(nn.Module):
         if self.has_cross_attn:
             if cross_kv is None:
                 assert encoder_hidden_states is not None
-                cross_kv, cross_mask = self.prepare_cross(encoder_hidden_states, encoder_mask)
+                # K / V projected inside each layer's forward (per layer FSDP units, checkpointed w/ the layer)
+                states, cross_mask = prepare_cross_attn(
+                    encoder_hidden_states, encoder_mask, self.cfg.cross_attn_backend)
+                cross_kv = [states] * len(self.layers)
             elif cross_mask is None and encoder_mask is not None:
                 cross_mask = CrossAttnMask('sdpa', encoder_mask.bool())
         else:

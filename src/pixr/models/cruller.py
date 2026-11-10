@@ -1,5 +1,5 @@
 from dataclasses import replace
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -9,7 +9,7 @@ from .image_encoder_timm import ImageEncoderTimm
 from .text_decoder import TextDecoder
 from .text_decoder_ettin import EttinTextDecoder
 from .text_decoder_qwen3 import Qwen3TextDecoder
-from .param_groups import complete_layer_map, decoder_layer_map, timm_layer_map
+from .param_groups import block_modules, complete_layer_map, decoder_layer_map, timm_layer_map
 
 
 def create_text_decoder(cfg: TextDecoderCfg, vocab_size: int, pad_token_id: int):
@@ -40,6 +40,13 @@ class Cruller(nn.Module):
     def set_grad_checkpointing(self, enable=True):
         self.image_encoder.set_grad_checkpointing(enable)
         self.text_decoder.set_grad_checkpointing(enable)
+
+    def fsdp_shard_modules(self) -> List[Tuple[str, nn.Module]]:
+        """ (name, module) blocks wrapped individually for FSDP2 / composable activation checkpointing. """
+        return (
+            block_modules(self.image_encoder.trunk, 'image_encoder.trunk.')
+            + block_modules(self.text_decoder, 'text_decoder.', 'layers')
+        )
 
     @torch.jit.ignore
     def no_weight_decay(self):

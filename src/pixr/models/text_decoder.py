@@ -10,7 +10,7 @@ does not depend on transformers model internals. Supports:
 import logging
 import math
 from dataclasses import replace
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -58,14 +58,17 @@ class Attention(nn.Module):
     def forward(
             self,
             x: torch.Tensor,
-            kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+            kv: Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None,
             attn_mask: Optional[torch.Tensor] = None,
             is_causal: bool = False,
     ):
+        """ `kv` is None (self-attention), pre-projected (k, v), or a [B, S, C] tensor to project (cross-attention). """
         B, N, C = x.shape
         q = self.q_norm(self._split(self.q_proj(x)))
         if kv is None:
             kv = self.project_kv(x)
+        elif isinstance(kv, torch.Tensor):
+            kv = self.project_kv(kv)
         k, v = kv
         if isinstance(attn_mask, CrossAttnMask):
             x = cross_attention(q, k, v, attn_mask, dropout_p=self.attn_drop if self.training else 0.)
@@ -107,7 +110,7 @@ class DecoderLayer(nn.Module):
     def forward(
             self,
             x: torch.Tensor,
-            cross_kv: Tuple[torch.Tensor, torch.Tensor],
+            cross_kv: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
             cross_mask: Optional[torch.Tensor] = None,
             self_mask: Optional[torch.Tensor] = None,
             cache: Optional[Dict[str, torch.Tensor]] = None,
@@ -292,7 +295,9 @@ class TextDecoder(nn.Module):
 
         if cross_kv is None:
             assert encoder_hidden_states is not None
-            cross_kv, cross_mask = self.prepare_cross(encoder_hidden_states, encoder_mask)
+            # K / V projected inside each layer's forward (per layer FSDP units, checkpointed w/ the layer)
+            states, cross_mask = prepare_cross_attn(encoder_hidden_states, encoder_mask, self.cfg.cross_attn_backend)
+            cross_kv = [states] * len(self.layers)
         elif cross_mask is None and encoder_mask is not None:
             cross_mask = CrossAttnMask('sdpa', encoder_mask.bool())
 

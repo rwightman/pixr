@@ -8,7 +8,7 @@ Components:
 Layer ids increase from input (0) to output (num_layers - 1) within each component.
 """
 import re
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 from torch import nn
 
@@ -66,3 +66,11 @@ def complete_layer_map(model: nn.Module, layer_map: LayerMap, component: str = '
         if n not in layer_map:
             layer_map[n] = (component, 0, 1)
     return layer_map
+
+
+def block_modules(module: nn.Module, prefix: str, attr: str = 'blocks') -> List[Tuple[str, nn.Module]]:
+    """ (name, block) pairs of a module's block list, the per block units for FSDP2 / activation checkpointing. """
+    blocks = getattr(module, attr, None)
+    if blocks is None:
+        return []
+    return [(f'{prefix}{attr}.{i}', blk) for i, blk in enumerate(blocks)]

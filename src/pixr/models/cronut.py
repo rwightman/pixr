@@ -24,7 +24,7 @@ from timm.layers import DropPath
 
 from .attention import build_prefix_lm_block_mask, self_attention, has_flex
 from .config import CronutCfg, ImageEncoderCfg, ModelCfg
-from .param_groups import decoder_layer_map
+from .param_groups import block_modules, decoder_layer_map
 
 _ACT = {'silu': F.silu, 'gelu': F.gelu}
 
@@ -232,6 +232,10 @@ class Cronut(nn.Module):
     @torch.jit.ignore
     def set_grad_checkpointing(self, enable=True):
         self.grad_checkpointing = enable
+
+    def fsdp_shard_modules(self) -> List[Tuple[str, nn.Module]]:
+        """ (name, module) blocks wrapped individually for FSDP2 / composable activation checkpointing. """
+        return block_modules(self, '', 'layers')
 
     @torch.jit.ignore
     def no_weight_decay(self):
