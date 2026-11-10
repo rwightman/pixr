@@ -15,6 +15,8 @@ ACCUM=${ACCUM:-4}  # global batch = NUM_GPUS * BATCH_SIZE * ACCUM
 NUM_INTERVALS=${NUM_INTERVALS:-40}
 SAMPLES_PER_INTERVAL=${SAMPLES_PER_INTERVAL:-200000}
 LR=${LR:-3e-4}
+ENC_LR_SCALE=${ENC_LR_SCALE:-0.1}  # pretrained image encoder LR multiplier (1.0 wrecks pretrained features early)
+SYNTH_PROB=${SYNTH_PROB:-0.0}  # synthetic text renderings of the page text (1.0 for a reading warmup)
 WORKERS=${WORKERS:-24}
 CURL="curl -s -f -L --http1.1 --retry 10 --retry-all-errors"
 IDL_SOURCE=${IDL_SOURCE:-"pipe:${CURL} https://huggingface.co/datasets/pixparse/idl-wds/resolve/main/idl-train-0{0001..2999}.tar"}
@@ -31,6 +33,8 @@ python -m torch.distributed.run --nproc_per_node "${NUM_GPUS}" -m pixr.app.train
   --trainer.num-intervals "${NUM_INTERVALS}" \
   --trainer.num-warmup-intervals 1 \
   --trainer.opt.learning-rate "${LR}" \
+  --trainer.opt.encoder-lr-scale "${ENC_LR_SCALE}" \
+  --task.synth-prob "${SYNTH_PROB}" \
   --trainer.opt.grad-accum-steps "${ACCUM}" \
   --trainer.opt.weight-decay 0.05 \
   --trainer.log-frequency 50 \

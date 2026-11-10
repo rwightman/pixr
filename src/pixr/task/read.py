@@ -2,10 +2,11 @@
 import json
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict
 
 import chugr
+from chugr.doc import SynthTextCfg
 
 from pixr.framework import DeviceEnv, TaskCfg
 from pixr.utils import text_error_rates
@@ -23,6 +24,10 @@ class ReadTaskCfg(TaskCfg):
     metrics_max_new_tokens: int = 512
     eval_max_new_tokens: int = 1023
     eval_page_sampling: str = 'first'
+    # synthetic text rendering (of the sample's own annotation text, target == rendered text, no bboxes used)
+    synth_prob: float = 0.  # train, probability of a synthetic rendering replacing the page
+    eval_synth_prob: float = 0.  # eval, 1.0 for held-out synthetic reading CER
+    synth: SynthTextCfg = field(default_factory=SynthTextCfg)
 
 
 class ReadTask(ImageTextTask):
@@ -48,6 +53,8 @@ class ReadTask(ImageTextTask):
             image_input_feat=image_feature_info(self.input_info['image_fmt']),
             page_sampling=self.cfg.page_sampling,
             render_dpi=self.cfg.render_dpi,
+            synth_prob=self.cfg.synth_prob,
+            synth_cfg=self.cfg.synth,
             error_handler='log_and_continue',
         )
 
@@ -59,6 +66,8 @@ class ReadTask(ImageTextTask):
             image_input_feat=image_feature_info(self.input_info['image_fmt']),
             page_sampling=self.cfg.eval_page_sampling,
             render_dpi=self.cfg.render_dpi,
+            synth_prob=self.cfg.eval_synth_prob,
+            synth_cfg=self.cfg.synth,
             error_handler='log_and_continue',
         )
 
