@@ -19,6 +19,7 @@ from torch.utils.checkpoint import checkpoint
 
 from .attention import CrossAttnMask, prepare_cross_attn, build_prefix_lm_block_mask, self_attention, has_flex
 from .config import TextDecoderCfg
+from .kv_cache import CrossMemory, LayerKVCache
 from .text_decoder import Attention
 from .text_decoder_ettin import apply_rope
 
@@ -60,10 +61,10 @@ class GqaAttention(nn.Module):
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
         if cache is not None:
-            if 'k' in cache:
-                k = torch.cat([cache['k'], k], dim=2)
-                v = torch.cat([cache['v'], v], dim=2)
-            cache['k'], cache['v'] = k, v
+            if cache.k is not None:
+                k = torch.cat([cache.k, k], dim=2)
+                v = torch.cat([cache.v, v], dim=2)
+            cache.k, cache.v = k, v
         x = self_attention(
             q, k, v,
             attn_mask=attn_mask,
@@ -99,9 +100,19 @@ class Qwen3Layer(nn.Module):
         self.post_attention_layernorm = RMSNorm(dim, eps=eps)
         self.mlp = SwiGLU(dim, ffn_dim)
 
-    def forward(self, x, rope, mask=None, is_causal=False, cache=None, cross_kv=None, cross_mask=None):
+    def forward(
+            self, x, rope, mask=None, is_causal=False, cache=None, cross_states=None, cross_mask=None,
+            cross_slot=None):
+        """ `cross_slot`: this layer's cross-attn K / V slot (generation), projected here on first use from
+        `cross_states` and reused after. W/o a slot (training) K / V are projected every forward. """
         x = x + self.self_attn(self.input_layernorm(x), rope, attn_mask=mask, is_causal=is_causal, cache=cache)
         if self.cross_attn is not None:
+            cross_kv = cross_states
+            if cross_slot is not None:
+                if cross_slot.k is None:
+                    assert cross_states is not None, 'encoder states are required to fill the cross-attention slot'
+                    cross_slot.k, cross_slot.v = self.cross_attn.project_kv(cross_states)
+                cross_kv = (cross_slot.k, cross_slot.v)
             x = x + self.cross_attn(self.cross_attn_norm(x), kv=cross_kv, attn_mask=cross_mask)
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
@@ -184,16 +195,15 @@ class Qwen3TextDecoder(nn.Module):
     def no_weight_decay(self):
         return {'embed_tokens.weight'}
 
-    def prepare_cross(self, encoder_hidden_states: torch.Tensor, encoder_mask: Optional[torch.Tensor] = None):
-        """ Encoder output -> (per-layer cross-attn K / V, cross-attn mask) w/ the configured backend. """
+    def prepare_cross(
+            self,
+            encoder_hidden_states: torch.Tensor,
+            encoder_mask: Optional[torch.Tensor] = None,
+    ) -> CrossMemory:
+        """ Encoder output -> per image cross-attention memory for generation (states / mask prepared w/ the
+        configured backend, K / V are projected by the layers on first use). """
         states, mask = prepare_cross_attn(encoder_hidden_states, encoder_mask, self.cfg.cross_attn_backend)
-        return self.project_cross_kv(states), mask
-
-    def project_cross_kv(self, encoder_hidden_states: torch.Tensor):
-        return [
-            layer.cross_attn.project_kv(encoder_hidden_states) if layer.cross_attn is not None else None
-            for layer in self.layers
-        ]
+        return CrossMemory(states, mask, num_layers=len(self.layers), batch_size=encoder_hidden_states.shape[0])
 
     def _rope(self, position_ids: torch.Tensor):
         freqs = position_ids[..., None].float() * self.inv_freq
@@ -205,20 +215,19 @@ class Qwen3TextDecoder(nn.Module):
             input_ids: torch.Tensor,
             encoder_hidden_states: Optional[torch.Tensor] = None,
             encoder_mask: Optional[torch.Tensor] = None,
-            cross_kv=None,
             position_ids: Optional[torch.Tensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
-            cache: Optional[List[Dict[str, torch.Tensor]]] = None,
+            cache: Optional[List[LayerKVCache]] = None,
             prefix_embeds: Optional[torch.Tensor] = None,
             prefix_mask: Optional[torch.Tensor] = None,
             prefix_len: Optional[int] = None,
-            cross_mask: Optional[CrossAttnMask] = None,
+            cross_memory: Optional[CrossMemory] = None,
             return_hidden: bool = False,
     ) -> torch.Tensor:
         """ Same interface as EttinTextDecoder (prefix-LM and / or cross-attn), returns text position logits. """
         B, T = input_ids.shape
         device = input_ids.device
-        past_len = cache[0]['k'].shape[2] if cache is not None and 'k' in cache[0] else 0
+        past_len = cache[0].k.shape[2] if cache is not None and cache[0].k is not None else 0
 
         x = self.embed_tokens(input_ids)
         P = 0
@@ -238,18 +247,16 @@ class Qwen3TextDecoder(nn.Module):
                 position_ids = torch.arange(past_len, S, device=device).unsqueeze(0).expand(B, -1)
         rope = self._rope(position_ids)
 
+        # cross-attn K / V are projected inside each layer's forward (per layer FSDP units, checkpointed w/ the
+        # layer), every forward for training, once into the memory's per layer slots for generation
+        cross_states, cross_mask, cross_slots = None, None, None
         if self.has_cross_attn:
-            if cross_kv is None:
+            if cross_memory is not None:
+                cross_states, cross_mask, cross_slots = cross_memory.states, cross_memory.mask, cross_memory.slots
+            else:
                 assert encoder_hidden_states is not None
-                # K / V projected inside each layer's forward (per layer FSDP units, checkpointed w/ the layer)
-                states, cross_mask = prepare_cross_attn(
+                cross_states, cross_mask = prepare_cross_attn(
                     encoder_hidden_states, encoder_mask, self.cfg.cross_attn_backend)
-                cross_kv = [states] * len(self.layers)
-            elif cross_mask is None and encoder_mask is not None:
-                cross_mask = CrossAttnMask('sdpa', encoder_mask.bool())
-        else:
-            cross_kv = [None] * len(self.layers)
-            cross_mask = None
 
         use_flex = (
             self.cfg.self_attn_backend == 'flex' and has_flex and past_len == 0 and L > 1
@@ -277,9 +284,13 @@ class Qwen3TextDecoder(nn.Module):
         for i, layer in enumerate(self.layers):
             layer_cache = cache[i] if cache is not None else None
             if self.grad_checkpointing and self.training and layer_cache is None:
-                x = checkpoint(layer, x, rope, mask, is_causal, None, cross_kv[i], cross_mask, use_reentrant=False)
+                x = checkpoint(layer, x, rope, mask, is_causal, None, cross_states, cross_mask, use_reentrant=False)
             else:
-                x = layer(x, rope, mask, is_causal, layer_cache, cross_kv[i], cross_mask)
+                x = layer(
+                    x, rope, mask, is_causal, layer_cache, cross_states, cross_mask,
+                    cross_slot=cross_slots[i] if cross_slots is not None else None)
+        if cross_slots is not None:
+            cross_memory.states = None  # all slots are filled, the states aren't needed again
 
         x = self.norm(x[:, P:])
         if return_hidden:

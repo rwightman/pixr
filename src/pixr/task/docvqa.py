@@ -24,6 +24,7 @@ DOCVQA_TOKENS = (DOCVQA_START_TOKEN, '<s_question>', '</s_question>', '<s_answer
 class DocVqaTaskCfg(TaskCfg):
     text_max_length: int = 128
     eval_max_new_tokens: int = 64
+    eval_num_beams: int = 1  # beam search for eval generation, 1 == greedy
 
 
 class DocVqaTask(ImageTextTask):
@@ -65,7 +66,8 @@ class DocVqaTask(ImageTextTask):
             prompts = [self.tokenizer(DOCVQA_START_TOKEN + p, add_special_tokens=False).input_ids
                        for p in batch['text_input']]
             generated = self.generate(
-                batch['image_input'], prompts, self.stop_token_ids, self.cfg.eval_max_new_tokens, use_ema=use_ema)
+                batch['image_input'], prompts, self.stop_token_ids, self.cfg.eval_max_new_tokens, use_ema=use_ema,
+                num_beams=self.cfg.eval_num_beams)
             answers = [self.tokenizer.decode(g, skip_special_tokens=True).strip() for g in generated]
             for answer, parse in zip(answers, batch['_parse']):
                 gt = parse.get('answers') or []
@@ -77,11 +79,8 @@ class DocVqaTask(ImageTextTask):
                     'anls': anls_score(answer, gt) if gt else None,
                 })
         if self.device_env.world_size > 1:
-            merged = {}
-            for i, r in enumerate([r for rank in self.device_env.all_gather_object(results) for r in rank]):
-                # de-dupe samples padded by the (HF dataset) distributed sampler, samples w/o ids are kept
-                merged.setdefault(r['questionId'] if r['questionId'] is not None else ('_no_id', i), r)
-            results = list(merged.values())
+            # eval loaders split samples across ranks w/o padding / repeats, no de-dupe needed
+            results = [r for rank in self.device_env.all_gather_object(results) for r in rank]
         self.results = results
         scored = [r['anls'] for r in results if r['anls'] is not None]
         return {'anls': sum(scored) / max(len(scored), 1), 'num_samples': len(results)}

@@ -23,6 +23,7 @@ class ReadTaskCfg(TaskCfg):
     num_metrics_samples: int = 4  # train samples to decode (greedy) for train CER / WER
     metrics_max_new_tokens: int = 512
     eval_max_new_tokens: int = 1023
+    eval_num_beams: int = 1  # beam search for eval generation, 1 == greedy
     eval_page_sampling: str = 'first'
     # synthetic text rendering (of the sample's own annotation text, target == rendered text, no bboxes used)
     synth_prob: float = 0.  # train, probability of a synthetic rendering replacing the page
@@ -78,7 +79,11 @@ class ReadTask(ImageTextTask):
         """ Greedy decode a few train samples, CER / WER vs the targets (both capped at metrics_max_new_tokens). """
         n = min(self.cfg.num_metrics_samples, batch['text_input'].shape[0])
         image_input = batch['image_input']
-        image_input = {k: v[:n] for k, v in image_input.items()} if isinstance(image_input, dict) else image_input[:n]
+        if isinstance(image_input, dict):
+            # NOTE patch_valid is None for batches w/o padding
+            image_input = {k: v[:n] if v is not None else None for k, v in image_input.items()}
+        else:
+            image_input = image_input[:n]
         generated = self.generate(
             image_input, self._prompts(n), [self.tokenizer.eos_token_id], self.cfg.metrics_max_new_tokens)
         predictions = self.tokenizer.batch_decode(generated, skip_special_tokens=True)
@@ -92,13 +97,17 @@ class ReadTask(ImageTextTask):
         _logger.info(f'Sample target:     {targets[0][:300]!r}')
         return {'train_cer': rates['cer'], 'train_wer': rates['wer']}, {'prediction': predictions[0], 'target': targets[0]}
 
-    def _truncate_reference(self, text: str) -> Tuple[str, bool]:
-        """ Cap the reference at the eval generation budget (eval_max_new_tokens). Pages w/ longer transcriptions
-        can't be fully predicted, w/o the cap their CER is inflated by the unreachable tail. """
+    def _prepare_reference(self, text: str) -> Tuple[str, bool]:
+        """ Reference text for eval metrics, returns (text, truncated).
+
+        * Every reference takes the same tokenizer round trip as the predictions (decoded token ids), so both
+          sides share its text normalization (whitespace, characters the tokenizer can't represent).
+        * Capped at the eval generation budget (eval_max_new_tokens). Pages w/ longer transcriptions can't be
+          fully predicted, w/o the cap their CER is inflated by the unreachable tail.
+        """
         ids = self.tokenizer(text, add_special_tokens=False).input_ids
-        if len(ids) <= self.cfg.eval_max_new_tokens:
-            return text, False
-        return self.tokenizer.decode(ids[:self.cfg.eval_max_new_tokens], skip_special_tokens=True), True
+        max_tokens = self.cfg.eval_max_new_tokens
+        return self.tokenizer.decode(ids[:max_tokens], skip_special_tokens=True), len(ids) > max_tokens
 
     def evaluate(self, loader, use_ema: bool = False) -> Dict[str, Any]:
         predictions, references = [], []
@@ -107,10 +116,10 @@ class ReadTask(ImageTextTask):
             texts = batch['text_input']
             generated = self.generate(
                 batch['image_input'], self._prompts(len(texts)), [self.tokenizer.eos_token_id],
-                self.cfg.eval_max_new_tokens, use_ema=use_ema)
+                self.cfg.eval_max_new_tokens, use_ema=use_ema, num_beams=self.cfg.eval_num_beams)
             predictions.extend(self.tokenizer.batch_decode(generated, skip_special_tokens=True))
             for t in texts:
-                ref, truncated = self._truncate_reference(t[0] if isinstance(t, (list, tuple)) else t)
+                ref, truncated = self._prepare_reference(t[0] if isinstance(t, (list, tuple)) else t)
                 references.append(ref)
                 num_truncated += truncated
         if self.device_env.world_size > 1:

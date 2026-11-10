@@ -60,6 +60,15 @@ class TiktokenTokenizer:
             self._update_split()
         return added
 
+    @property
+    def all_special_ids(self) -> List[int]:
+        # control (eos / pad / bos) and added tokens, all special
+        return list(self._special.values())
+
+    def get_added_vocab(self) -> Dict[str, int]:
+        # tokens above the base BPE vocab (control & added), as HF tokenizers
+        return dict(self._special)
+
     def get_vocab(self) -> Dict[str, int]:
         # NOTE only special / added tokens, the base BPE vocab is bytes based (not needed by pixr)
         return dict(self._special)

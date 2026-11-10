@@ -8,7 +8,6 @@
 `prepare_cross_attn` returns the encoder states to project K / V from (packed for varlen) and a CrossAttnMask
 that is passed to every cross-attention layer.
 """
-from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -26,12 +25,23 @@ if has_flex:
 CROSS_ATTN_BACKENDS = ('sdpa', 'varlen', 'flex')
 
 
-@dataclass
 class CrossAttnMask:
-    backend: str
-    key_valid: torch.Tensor  # [B, S] bool validity of encoder tokens (padded layout)
-    varlen: Optional[VarlenMeta] = None  # packing metadata when K / V are packed
-    _flex_masks: Dict[int, object] = field(default_factory=dict)
+    """ Cross-attention key mask of a batch of (padded) encoder sequences.
+
+    A plain class (not a dataclass), FSDP2 input casting rebuilds dataclasses passed into a wrapped layer, the
+    lazily built flex block masks cached here would be built on a copy and lost (rebuilt every layer / step).
+    """
+    __slots__ = ('backend', 'key_valid', 'varlen', '_flex_masks')
+
+    def __init__(self, backend: str, key_valid: torch.Tensor, varlen: Optional[VarlenMeta] = None):
+        self.backend = backend
+        self.key_valid = key_valid  # [B, S] bool validity of encoder tokens (padded layout)
+        self.varlen = varlen  # packing metadata when K / V are packed
+        self._flex_masks: Dict[int, object] = {}
+
+    @property
+    def batch_size(self) -> int:
+        return self.key_valid.shape[0]
 
     def sdpa_mask(self) -> torch.Tensor:
         return self.key_valid[:, None, None, :]

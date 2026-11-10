@@ -38,7 +38,7 @@ class ImageEncoderCfg(Serializable):
     drop_rate: Optional[float] = None
     drop_path_rate: Optional[float] = None
     patch_drop_rate: Optional[float] = None
-    attn_backend: Optional[str] = None  # NaFlexVit attention backend ('sdpa', 'sdpa_auto', 'varlen', 'flex')
+    attn_backend: Optional[str] = None  # NaFlexVit attention backend ('sdpa', 'varlen', 'flex')
 
     @property
     def is_naflex(self) -> bool:

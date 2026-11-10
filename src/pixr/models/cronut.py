@@ -25,6 +25,7 @@ from timm.layers import DropPath
 
 from .attention import build_prefix_lm_block_mask, self_attention, has_flex
 from .config import CronutCfg, ImageEncoderCfg, ModelCfg
+from .kv_cache import DecodeState, LayerKVCache, PrefixMemory
 from .param_groups import block_modules, decoder_layer_map
 
 _logger = logging.getLogger(__name__)
@@ -45,7 +46,11 @@ def rotate_half(x):
 
 
 class MRoPE(nn.Module):
-    """ 3-axis (T / H / W) interleaved multimodal rotary embedding. """
+    """ 3-axis (T / H / W) multimodal rotary embedding.
+
+    interleaved (Qwen3-VL): H / W take every 3rd frequency (from offsets 1 / 2), T the rest.
+    non-interleaved (Qwen2-VL): contiguous frequency sections, T the first mrope_section[0], then H, then W.
+    """
 
     def __init__(self, head_dim: int, mrope_section: Tuple[int, int, int], theta: float, interleaved: bool = True):
         super().__init__()
@@ -78,9 +83,18 @@ class MRoPE(nn.Module):
                 f[..., axis:length:3] = freqs[axis, ..., axis:length:3]
             freqs = f
         else:
-            freqs = freqs[0]
+            freqs = torch.cat([f[axis] for axis, f in enumerate(freqs.split(self.mrope_section, dim=-1))], dim=-1)
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos()[:, None], emb.sin()[:, None]
+
+
+def _patch_valid(image_input: Dict[str, Any]) -> torch.Tensor:
+    """ [B, N] bool patch validity, patch_valid is None (or absent) for a batch w/o padding """
+    valid = image_input.get('patch_valid', None)
+    if valid is None:
+        coord = image_input['patch_coord']
+        return torch.ones(coord.shape[:2], dtype=torch.bool, device=coord.device)
+    return valid.bool()
 
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -117,10 +131,10 @@ class CronutAttention(nn.Module):
         q, k = self.q_norm(q), self.k_norm(k)
         q, k = apply_rope(q, cos, sin).to(v.dtype), apply_rope(k, cos, sin).to(v.dtype)
         if cache is not None:
-            if 'k' in cache:
-                k = torch.cat([cache['k'], k], dim=2)
-                v = torch.cat([cache['v'], v], dim=2)
-            cache['k'], cache['v'] = k, v
+            if cache.k is not None:
+                k = torch.cat([cache.k, k], dim=2)
+                v = torch.cat([cache.v, v], dim=2)
+            cache.k, cache.v = k, v
         out = self_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal).transpose(1, 2)  # B, S, H, D
         if gate is not None:
             out = out * torch.sigmoid(gate.view(B, S, self.num_heads, self.head_dim))
@@ -265,7 +279,7 @@ class Cronut(nn.Module):
         return self.text_norm_pre(self.in_proj(self.text_embed(ids)))
 
     def _image_positions(self, image_input):
-        coord, valid = image_input['patch_coord'], image_input['patch_valid'].bool()
+        coord, valid = image_input['patch_coord'], _patch_valid(image_input)
         B, N, _ = coord.shape
         pos = coord.new_zeros((3, B, N), dtype=torch.long)
         pos[1] = coord[..., 0].long()
@@ -311,12 +325,21 @@ class Cronut(nn.Module):
             layer_map['image_encoder.' + n] = ('encoder', 0, 1)
         return layer_map
 
-    def _prefix_forward(self, image_input, text_ids, text_mask, cache=None, return_hidden=False):
-        """ Run [image ; text] through the trunk, returns text position logits and the final text positions. """
+    def encode_image(self, image_input: Dict[str, torch.Tensor]) -> PrefixMemory:
+        """ Image -> per image decoding memory: patch embeddings, validity, image (T / H / W) position ids and the
+        first text position of each image. """
+        return self._encode_image(image_input)
+
+    def _encode_image(self, image_input: Dict[str, torch.Tensor]) -> PrefixMemory:
+        # NOTE forward() uses this directly, encode_image() is a (FSDP registered) generation entry point
         assert isinstance(image_input, dict), 'Cronut requires NaFlex (patch dict) image input.'
         img = self.image_encoder(image_input['patches'])
-        patch_valid = image_input['patch_valid'].bool()
         img_pos, text_start = self._image_positions(image_input)
+        return PrefixMemory(img, _patch_valid(image_input), pos=img_pos, text_start=text_start)
+
+    def _prefix_forward(self, memory: PrefixMemory, text_ids, text_mask, cache=None, return_hidden=False):
+        """ Run [image ; text] through the trunk, returns text position logits and the final text positions. """
+        img, patch_valid, img_pos, text_start = memory.embeds, memory.mask, memory.pos, memory.text_start
         txt = self.embed_text(text_ids)
         x = torch.cat([img, txt.to(img.dtype)], dim=1)
         P = img.shape[1]
@@ -337,21 +360,29 @@ class Cronut(nn.Module):
     ) -> torch.Tensor:
         """ Teacher forced forward, returns text logits [B, T, V] (or pre-head features w/ return_hidden). """
         text_mask = torch.ones_like(text_input, dtype=torch.bool)  # right padded text, causal attention
-        out, _, _ = self._prefix_forward(image_input, text_input, text_mask, return_hidden=return_hidden)
+        memory = self._encode_image(image_input)
+        out, _, _ = self._prefix_forward(memory, text_input, text_mask, return_hidden=return_hidden)
         return out
 
-    def prefill(self, image_input, prompt_ids: torch.Tensor, prompt_mask: torch.Tensor):
-        cache = [{} for _ in self.layers]
-        logits, key_valid, last_pos = self._prefix_forward(image_input, prompt_ids, prompt_mask, cache=cache)
-        state = dict(cache=cache, key_valid=key_valid, pos=last_pos)
+    def prefill(self, memory: PrefixMemory, prompt_ids: torch.Tensor, prompt_mask: torch.Tensor):
+        """ Run [image ; (left padded) prompts], returns next token logits [B, V] and the decoding state.
+
+        NOTE the image prefix K / V are part of the self-attention cache (per hypothesis), one prompt per image.
+        """
+        assert prompt_ids.shape[0] == memory.embeds.shape[0], \
+            'one prompt per image, expand the state for more hypotheses'
+        cache = [LayerKVCache() for _ in self.layers]
+        logits, key_valid, last_pos = self._prefix_forward(memory, prompt_ids, prompt_mask, cache=cache)
+        state = DecodeState(
+            cache=cache, attn_mask=key_valid, pos=last_pos, memory=memory, prefix_len=memory.embeds.shape[1])
         return logits[:, -1], state
 
-    def step(self, token_ids: torch.Tensor, state: Dict[str, Any]):
-        state['pos'] = state['pos'] + 1
-        state['key_valid'] = torch.cat([state['key_valid'], state['key_valid'].new_ones(token_ids.shape)], dim=1)
+    def step(self, token_ids: torch.Tensor, state: DecodeState):
+        state.pos = state.pos + 1
+        state.attn_mask = torch.cat([state.attn_mask, state.attn_mask.new_ones(token_ids.shape)], dim=1)
         x = self.embed_text(token_ids)
-        pos = state['pos'][None, :, None].expand(3, -1, 1)
+        pos = state.pos[None, :, None].expand(3, -1, 1)
         cos, sin = self.rotary(pos)
-        attn_mask = state['key_valid'][:, None, None, :]
-        x = self._run(x, cos, sin, attn_mask, cache=state['cache'])
+        attn_mask = state.attn_mask[:, None, None, :]
+        x = self._run(x, cos, sin, attn_mask, cache=state.cache)
         return self._logits(x)[:, -1], state

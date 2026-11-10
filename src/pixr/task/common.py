@@ -10,7 +10,7 @@ from chugr.doc import DEFAULT_DOC_KEY
 from pixr.data import create_image_preprocessor, ImagePreprocessorFactory
 from pixr.framework import DeviceEnv, TaskCfg, TrainingTask
 from pixr.framework.task import move_to_device
-from pixr.generation import generate_greedy
+from pixr.generation import generate_beam, generate_greedy
 from pixr.loss import fused_linear_cross_entropy, lm_cross_entropy
 from pixr.models import ModelArgs, ModelCfg, Cruller, create_model, load_model_state
 from pixr.tokenizers import TokenizerCfg, create_tokenizer, get_added_tokens
@@ -74,9 +74,29 @@ def to_device(x: Union[torch.Tensor, Dict[str, torch.Tensor]], device, non_block
     return x.to(device, non_blocking=non_blocking)
 
 
-def trim_padding(text_input: torch.Tensor, text_target: torch.Tensor, pad_token_id: int):
-    """ Trim batch sequence length to the longest non-pad sequence. """
+def drop_full_patch_valid(image_input):
+    """ NaFlex (patch dict) input, drop the patch validity mask of a batch w/o padding (None == all valid).
+
+    Models then skip padding masks entirely (unmasked attention can use the fastest kernels, e.g. fixed resolution
+    inference). Only checked while the mask is on the CPU (before the device transfer), so there is no GPU sync
+    or data dependent branch in the model.
+    """
+    if isinstance(image_input, dict):
+        valid = image_input.get('patch_valid')
+        if isinstance(valid, torch.Tensor) and valid.device.type == 'cpu' and bool(valid.all()):
+            image_input = {**image_input, 'patch_valid': None}
+    return image_input
+
+
+def trim_padding(text_input: torch.Tensor, text_target: torch.Tensor, pad_token_id: int, multiple: int = 1):
+    """ Trim batch sequence length to the longest non-pad sequence (right padded), rounded up to `multiple`.
+
+    NOTE reads the length (a sync for device tensors), call on CPU batches before the device transfer.
+    """
     max_len = int((text_input != pad_token_id).sum(1).max().item())
+    if multiple > 1:
+        max_len = -(-max_len // multiple) * multiple
+    max_len = min(max(max_len, 1), text_input.shape[1])
     return text_input[:, :max_len], text_target[:, :max_len]
 
 
@@ -113,7 +133,8 @@ class ImageTextTask(TrainingTask):
 
         Returns (outputs, losses), w/ the fused (chunked) LM head + CE the full logits are never materialized.
         """
-        text_input, text_target = trim_padding(batch['text_input'], batch['text_target'], self.pad_token_id)
+        # NOTE padding is trimmed in prepare_batch (on the CPU), no length sync / data dependent shape logic here
+        text_input, text_target = batch['text_input'], batch['text_target']
         model = self.trainable_module  # possibly DDP / compile wrapped, for the forward
         target = text_target[:, 1:]
         z_loss = self.cfg.z_loss_weight > 0
@@ -146,21 +167,43 @@ class ImageTextTask(TrainingTask):
     def training_forward(self, batch: Dict[str, Any]):
         return self.lm_loss(batch)
 
+    def prepare_batch(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        # CPU side batch prep before the device transfer, keeps length / validity checks (syncs) out of the step
+        batch = dict(batch)
+        if 'image_input' in batch:
+            batch['image_input'] = drop_full_patch_valid(batch['image_input'])
+        text_input, text_target = batch.get('text_input'), batch.get('text_target')
+        if isinstance(text_input, torch.Tensor) and isinstance(text_target, torch.Tensor):
+            # text is padded to max_length per sample by the data pipeline, trim to the batch
+            batch['text_input'], batch['text_target'] = trim_padding(
+                text_input, text_target, self.pad_token_id, multiple=self.cfg.text_pad_multiple)
+        return super().prepare_batch(batch)
+
     @torch.no_grad()
     def generate(self, image_input, prompts: Sequence[Sequence[int]], stop_token_ids, max_new_tokens: int,
-                 use_ema: bool = False):
+                 use_ema: bool = False, num_beams: int = 1, length_penalty: float = 1.0):
+        """ Greedy (num_beams == 1) or beam search decode. Under FSDP call within `full_params(use_ema)`. """
         model = self.get_trainable_module(use_ema)
+        if not self.has_full_params(model):
+            # W/ sharded params every prefill / step would all-gather, ranks decode different numbers of steps
+            # (per rank stopping, uneven eval batches) and would hang waiting on each other.
+            raise RuntimeError(
+                f'Generation under FSDP requires `with task.full_params(use_ema={use_ema}):` around it '
+                f'(for the {"EMA" if use_ema else "model"} weights being generated from).')
         was_training = model.training
         model.eval()
+        kwargs = dict(
+            prompt_ids=prompts,
+            stop_token_ids=stop_token_ids,
+            pad_token_id=self.pad_token_id,
+            max_new_tokens=max_new_tokens,
+        )
+        image_input = move_to_device(drop_full_patch_valid(image_input), self.device)
         with self.autocast():
-            out = generate_greedy(
-                model,
-                move_to_device(image_input, self.device),
-                prompt_ids=prompts,
-                stop_token_ids=stop_token_ids,
-                pad_token_id=self.pad_token_id,
-                max_new_tokens=max_new_tokens,
-            )
+            if num_beams > 1:
+                out = generate_beam(model, image_input, num_beams=num_beams, length_penalty=length_penalty, **kwargs)
+            else:
+                out = generate_greedy(model, image_input, **kwargs)
         if was_training:
             model.train()
         return out

@@ -69,6 +69,12 @@ class ImageEncoderTimm(nn.Module):
         else:
             # create w/ default pooling so pretrained weights load strictly, then remove pooling & classifier
             # NOTE timm adapts pretrained (conv or NaFlex linear) patch embed weights to in_chans on load
+            if self.is_naflex and load_from_hub and in_chans != 3:
+                import timm.models._manipulate as timm_manipulate
+                if not hasattr(timm_manipulate, 'adapt_input_linear_patch'):
+                    raise RuntimeError(
+                        f'timm {timm.__version__} cannot adapt pretrained NaFlexVit linear patch embed weights to '
+                        f'in_chans={in_chans}, a timm w/ adapt_input_linear_patch (naflex-attn-backends) is required.')
             self.trunk = timm.create_model(
                 cfg.name,
                 pretrained=load_from_hub,
@@ -147,19 +153,22 @@ class ImageEncoderTimm(nn.Module):
         mask = None
         if isinstance(x, dict):
             assert self.is_naflex, 'Dict (patch sequence) input requires a NaFlex model.'
+            # NOTE patch_valid may be None (or absent) for a batch w/o padding, no masks are built then
+            patch_valid = x.get('patch_valid', None)
             out = self.trunk.forward_features(
                 patches=x['patches'],
                 patch_coord=x['patch_coord'],
-                patch_valid=x['patch_valid'],
+                patch_valid=patch_valid,
             )
             tokens = out['patches']
             valid = out.get('patch_valid', None)
             if valid is None:
-                valid = x['patch_valid']
-            if self.num_prefix_tokens:
-                prefix_valid = valid.new_ones(valid.shape[0], self.num_prefix_tokens)
-                valid = torch.cat([prefix_valid, valid], dim=1)
-            mask = valid.bool()
+                valid = patch_valid
+            if valid is not None:
+                if self.num_prefix_tokens:
+                    prefix_valid = valid.new_ones(valid.shape[0], self.num_prefix_tokens)
+                    valid = torch.cat([prefix_valid, valid], dim=1)
+                mask = valid.bool()
         else:
             tokens = self.trunk.forward_features(x)
             if tokens.ndim == 4:

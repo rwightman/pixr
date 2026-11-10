@@ -29,7 +29,7 @@ a self-contained text decoder, and fixes a number of issues that hampered the or
 
 ## Models
 
-Three model families share the same tasks, data pipelines, loss masking and (greedy, KV cached) generation:
+Three model families share the same tasks, data pipelines, loss masking and (greedy / beam search, KV cached) generation:
 
 * **Cruller** -- image encoder + autoregressive text decoder w/ cross-attention (Donut style)
 * **Fritter** -- image encoder -> (optional m x m token merge) -> projector -> image token prefix for a decoder-only
@@ -70,7 +70,7 @@ Padded NaFlex sequences can use a dense mask or a variable length kernel, select
 
 | field | options |
 |---|---|
-| `image_encoder.attn_backend` | `sdpa` (dense mask), `sdpa_auto`, `varlen` (packed, CUDA), `flex` (FlexAttention block mask) -- requires the timm `naflex-attn-backends` branch |
+| `image_encoder.attn_backend` | `sdpa` (dense mask), `varlen` (packed, CUDA), `flex` (FlexAttention block mask), batches w/o padding skip masking for all -- requires the timm `naflex-attn-backends` branch |
 | `text_decoder.cross_attn_backend` | `sdpa`, `varlen`, `flex` |
 | `text_decoder.self_attn_backend` | `sdpa` (dense prefix-LM mask), `flex` (prefix-LM block mask), Ettin / Qwen3 |
 | `cronut.attn_backend` | `sdpa`, `flex` |
@@ -117,6 +117,41 @@ Apps are configured by dataclasses parsed w/ [jsonargparse](https://github.com/o
 The full resolved config is written to `<output_dir>/<experiment>/config.yaml` and can be passed back via `--config`.
 
 ### Distributed / compile
+
+For short test / train / eval runs on two GPUs, use the scenario launcher from an environment with editable
+`pixr`, `chugr`, and the local `timm` installed:
+
+```bash
+python scripts/run_review.py --list
+python scripts/run_review.py all --validate                 # parse app args, no GPU jobs
+python scripts/run_review.py smoke --dry-run                # inspect commands
+python scripts/run_review.py smoke --devices 0,1
+python scripts/run_review.py fsdp_compile naflex_repeat prefix_flex
+python scripts/run_review.py data_ranks                     # check rank streams are distinct
+python scripts/run_review.py tests parity
+python scripts/run_review.py all
+```
+
+The launcher runs scenarios sequentially through `pixr.app.train`, `pixr.app.eval`, pytest and
+`scripts/check_distributed.py`. Scenarios cover DDP / FSDP2, gradient accumulation, compile, checkpointing, EMA,
+NaFlex batching, all three model families, attention backends, checkpoint resume and DocVQA fine-tuning.
+`data_ranks` checks actual resampled WDS sample identities across ranks, without loading a model or decoding PDFs.
+It fails if any two ranks receive an identical stream. App runs also fail if no updates or non-finite losses are logged.
+`parity` compares FP32 DDP / FSDP2 model and EMA parameters and fails above a relative L2 difference of `1e-5`;
+its resumed losses and generated outputs are also recorded for inspection.
+
+Defaults are short execution checks: random initialization, 64 global samples per interval, batch 2 per GPU,
+accumulation 2, 256 image patches and 128 text tokens. `--pretrained` enables hub weight initialization for the
+app runs; tokenizers and Qwen3 / Ettin configs can still require downloads without it. `pretrained_tests` downloads
+HF reference weights; `docvqa` uses the HF DocVQA dataset. `--samples`, `--batch-size`, `--accum`, `--patches`,
+`--text-length`, and `--workers` adjust the workload. These short random-weight runs do not measure convergence.
+
+The default data paths are sibling `../data/idl/idl-train-000{01..07}.tar` for training and shard `00000` for eval;
+override with `--train-source` / `--eval-source`. `naflex_repeat` needs at least `GPUs * workers` training shards.
+Logs, exact commands, resolved configs, checkpoints and `summary.json` go into a new `../runs/review-<timestamp>`
+directory (`--output` overrides it). Each command has a 20-minute timeout (`--timeout` in seconds). Failed scenarios
+are logged and the remaining scenarios continue; `--fail-fast` stops at the first failure. The launcher exits
+nonzero on failure and prints a `tail -f` command for the active log.
 
 Distributed runs (`torch.distributed.run`) use DDP by default, `--trainer.fsdp true` shards params, grads and
 optimizer state w/ FSDP2 (`fully_shard` per encoder block / decoder layer + root, models list their blocks in
@@ -183,7 +218,7 @@ Within `src/pixr`:
 * `models/` - modelling code with associated factory methods and helpers
 * `task/` - tasks (`read` pretraining, `docvqa` fine-tune), registered in `task/task_registry.py`
 * `tokenizers/` - tokenizer creation and task token handling
-* `generation.py` - batched, KV cached greedy decoding
+* `generation.py` - batched, KV cached greedy and beam search decoding (`--task.eval-num-beams`)
 * `utils/` - misc utils that don't have a home (`utils/cli.py` -- jsonargparse config / CLI parsing)
 
 ## Concepts & Terminology
@@ -208,7 +243,12 @@ With the Task concept, the data pipeline exists outside the task. The data pipel
 A task is a `TrainingTask` (an `nn.Module` wrapping the model) implementing `training_forward(batch) -> (outputs, losses)`,
 optional `train_metrics()`, and `evaluate(loader)`. The generic `Trainer` owns everything else (optimizer, schedule,
 AMP, accumulation, setup ordering for DDP / FSDP2 / compile, EMA, checkpointing state). Tasks are agnostic to the model family,
-Cruller, Fritter and Cronut share the same `prefill` / `step` generation interface.
+Cruller, Fritter and Cronut share the same generation interface: `memory = model.encode_image(image_input)` (per image,
+computed once), `logits, state = model.prefill(memory, prompt_ids, prompt_mask)`, `logits, state = model.step(token_ids, state)`
+and `state.reorder(parent_idx)` to select / duplicate hypotheses (beam search). The per image memory and the per hypothesis
+sequence state are separate (`pixr/models/kv_cache.py`): Cruller's cross-attention K / V are projected once inside each
+decoder layer and shared by all hypotheses of an image (several prompts or beams per image, image-major order), only the
+self-attention caches are reordered. Under FSDP, generation must run inside `task.full_params()`.
 
 ### Interval
 

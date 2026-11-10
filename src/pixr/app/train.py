@@ -19,7 +19,7 @@ import torch
 from chugr.common import DataArg, Serializable
 
 from pixr.data import create_loader
-from pixr.framework import DeviceEnv, Monitor, Trainer, TrainerCfg, setup_logging, random_seed
+from pixr.framework import DeviceEnv, destroy_distributed, Monitor, Trainer, TrainerCfg, setup_logging, random_seed
 from pixr.task import get_task, get_task_cfgs
 from pixr.utils import clean_name, get_latest_checkpoint
 from pixr.utils.cli import parse_cfg
@@ -181,4 +181,6 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    code = main()
+    destroy_distributed()
+    sys.exit(code)

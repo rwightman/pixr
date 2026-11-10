@@ -19,6 +19,7 @@ from torch.utils.checkpoint import checkpoint
 
 from .attention import CrossAttnMask, prepare_cross_attn, build_prefix_lm_block_mask, self_attention, has_flex
 from .config import TextDecoderCfg
+from .kv_cache import CrossMemory, LayerKVCache
 from .text_decoder import Attention
 
 _logger = logging.getLogger(__name__)
@@ -56,10 +57,10 @@ class RopeSelfAttention(nn.Module):
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
         if cache is not None:
-            if 'k' in cache:
-                k = torch.cat([cache['k'], k], dim=2)
-                v = torch.cat([cache['v'], v], dim=2)
-            cache['k'], cache['v'] = k, v
+            if cache.k is not None:
+                k = torch.cat([cache.k, k], dim=2)
+                v = torch.cat([cache.v, v], dim=2)
+            cache.k, cache.v = k, v
         x = self_attention(
             q, k, v,
             attn_mask=attn_mask,
@@ -111,12 +112,22 @@ class EttinDecoderLayer(nn.Module):
         self.mlp_norm = nn.LayerNorm(dim, eps=norm_eps, bias=False)
         self.mlp = GeGLU(dim, ffn_dim, drop=dropout)
 
-    def forward(self, x, rope, cross_kv=None, cross_mask=None, self_mask=None, is_causal=False, cache=None):
+    def forward(
+            self, x, rope, cross_states=None, cross_mask=None, self_mask=None, is_causal=False, cache=None,
+            cross_slot=None):
+        """ `cross_slot`: this layer's cross-attn K / V slot (generation), projected here on first use from
+        `cross_states` and reused after. W/o a slot (training) K / V are projected every forward. """
         x = x + F.dropout(
             self.attn(self.attn_norm(x), rope, attn_mask=self_mask, is_causal=is_causal, cache=cache),
             p=self.dropout, training=self.training,
         )
         if self.cross_attn is not None:
+            cross_kv = cross_states
+            if cross_slot is not None:
+                if cross_slot.k is None:
+                    assert cross_states is not None, 'encoder states are required to fill the cross-attention slot'
+                    cross_slot.k, cross_slot.v = self.cross_attn.project_kv(cross_states)
+                cross_kv = (cross_slot.k, cross_slot.v)
             x = x + F.dropout(
                 self.cross_attn(self.cross_attn_norm(x), kv=cross_kv, attn_mask=cross_mask),
                 p=self.dropout, training=self.training,
@@ -221,16 +232,15 @@ class EttinTextDecoder(nn.Module):
     def no_weight_decay(self):
         return {'embed_tokens.weight', 'output_bias'}
 
-    def prepare_cross(self, encoder_hidden_states: torch.Tensor, encoder_mask: Optional[torch.Tensor] = None):
-        """ Encoder output -> (per-layer cross-attn K / V, cross-attn mask) w/ the configured backend. """
+    def prepare_cross(
+            self,
+            encoder_hidden_states: torch.Tensor,
+            encoder_mask: Optional[torch.Tensor] = None,
+    ) -> CrossMemory:
+        """ Encoder output -> per image cross-attention memory for generation (states / mask prepared w/ the
+        configured backend, K / V are projected by the layers on first use). """
         states, mask = prepare_cross_attn(encoder_hidden_states, encoder_mask, self.cfg.cross_attn_backend)
-        return self.project_cross_kv(states), mask
-
-    def project_cross_kv(self, encoder_hidden_states: torch.Tensor) -> List[Optional[Tuple[torch.Tensor, torch.Tensor]]]:
-        return [
-            layer.cross_attn.project_kv(encoder_hidden_states) if layer.cross_attn is not None else None
-            for layer in self.layers
-        ]
+        return CrossMemory(states, mask, num_layers=len(self.layers), batch_size=encoder_hidden_states.shape[0])
 
     def _rope(self, position_ids: torch.Tensor, dtype):
         freqs = position_ids[..., None].float() * self.inv_freq
@@ -242,20 +252,21 @@ class EttinTextDecoder(nn.Module):
             input_ids: torch.Tensor,
             encoder_hidden_states: Optional[torch.Tensor] = None,
             encoder_mask: Optional[torch.Tensor] = None,
-            cross_kv: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
             position_ids: Optional[torch.Tensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
-            cache: Optional[List[Dict[str, torch.Tensor]]] = None,
+            cache: Optional[List[LayerKVCache]] = None,
             prefix_embeds: Optional[torch.Tensor] = None,
             prefix_mask: Optional[torch.Tensor] = None,
             prefix_len: Optional[int] = None,
-            cross_mask: Optional[CrossAttnMask] = None,
+            cross_memory: Optional[CrossMemory] = None,
             return_hidden: bool = False,
     ) -> torch.Tensor:
         """
         Args:
             input_ids: [B, T] text token ids
-            encoder_hidden_states / encoder_mask / cross_kv: cross-attention inputs (if cross-attn enabled)
+            encoder_hidden_states / encoder_mask: cross-attention inputs (if cross-attn enabled), training
+            cross_memory: per image cross-attention memory from prepare_cross() (generation), B may be a
+                multiple of its image batch (see CrossMemory)
             position_ids: [B, T(+P)] RoPE positions, default derived from attention_mask (or arange)
             attention_mask: [B, past + P + T] bool key validity over the full sequence
             cache: per-layer self-attention KV caches
@@ -270,7 +281,7 @@ class EttinTextDecoder(nn.Module):
         """
         B, T = input_ids.shape
         device = input_ids.device
-        past_len = cache[0]['k'].shape[2] if cache is not None and 'k' in cache[0] else 0
+        past_len = cache[0].k.shape[2] if cache is not None and cache[0].k is not None else 0
 
         x = self.embed_norm(self.embed_tokens(input_ids))
         P = 0
@@ -292,18 +303,16 @@ class EttinTextDecoder(nn.Module):
                 position_ids = torch.arange(past_len, S, device=device).unsqueeze(0).expand(B, -1)
         rope = self._rope(position_ids, None)
 
+        # cross-attn K / V are projected inside each layer's forward (per layer FSDP units, checkpointed w/ the
+        # layer), every forward for training, once into the memory's per layer slots for generation
+        cross_states, cross_mask, cross_slots = None, None, None
         if self.has_cross_attn:
-            if cross_kv is None:
+            if cross_memory is not None:
+                cross_states, cross_mask, cross_slots = cross_memory.states, cross_memory.mask, cross_memory.slots
+            else:
                 assert encoder_hidden_states is not None
-                # K / V projected inside each layer's forward (per layer FSDP units, checkpointed w/ the layer)
-                states, cross_mask = prepare_cross_attn(
+                cross_states, cross_mask = prepare_cross_attn(
                     encoder_hidden_states, encoder_mask, self.cfg.cross_attn_backend)
-                cross_kv = [states] * len(self.layers)
-            elif cross_mask is None and encoder_mask is not None:
-                cross_mask = CrossAttnMask('sdpa', encoder_mask.bool())
-        else:
-            cross_kv = [None] * len(self.layers)
-            cross_mask = None
 
         use_flex = (
             self.cfg.self_attn_backend == 'flex' and has_flex and past_len == 0 and L > 1
@@ -341,9 +350,13 @@ class EttinTextDecoder(nn.Module):
             is_causal = (not use_flex) and layer.is_global and mask is None and L > 1
             layer_cache = cache[i] if cache is not None else None
             if self.grad_checkpointing and self.training and layer_cache is None:
-                x = checkpoint(layer, x, rope, cross_kv[i], cross_mask, mask, is_causal, None, use_reentrant=False)
+                x = checkpoint(layer, x, rope, cross_states, cross_mask, mask, is_causal, None, use_reentrant=False)
             else:
-                x = layer(x, rope, cross_kv[i], cross_mask, mask, is_causal, layer_cache)
+                x = layer(
+                    x, rope, cross_states, cross_mask, mask, is_causal, layer_cache,
+                    cross_slot=cross_slots[i] if cross_slots is not None else None)
+        if cross_slots is not None:
+            cross_memory.states = None  # all slots are filled, the states aren't needed again
 
         x = x[:, P:]
         x = self.final_norm(x)

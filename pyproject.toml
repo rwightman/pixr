@@ -31,7 +31,9 @@ classifiers = [
 ]
 dependencies = [
     "torch",
-    "timm>=1.0.20",
+    # NOTE NaFlexVit attn_backend and pretrained linear patch embed in_chans adaptation need the timm
+    # naflex-attn-backends branch (based on, and still versioned as, 1.0.31), raise this pin once released
+    "timm>=1.0.31",
     "transformers",  # tokenizers only
     "huggingface_hub",
     "safetensors",

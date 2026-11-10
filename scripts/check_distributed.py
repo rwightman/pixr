@@ -16,6 +16,7 @@ numbers of batches / tokens, which would hang if any collective ran inside).
 """
 import argparse
 import json
+import math
 import os
 import time
 from dataclasses import replace
@@ -28,6 +29,8 @@ ap.add_argument('--mode', default='single', choices=('single', 'ddp', 'fsdp'))
 ap.add_argument('--tag', default='')
 ap.add_argument('--work-dir', default='./output/check_distributed')
 ap.add_argument('--compare', nargs='+', default=None, help='compare saved runs by tag, first is the reference')
+ap.add_argument('--max-param-rel-diff', type=float, default=None,
+                help='with --compare, fail if model / EMA parameter relative L2 difference exceeds this bound')
 ap.add_argument('--model', default='cruller_naflex_siglip2_base')
 ap.add_argument('--fp32', action='store_true', help='no AMP / FSDP mixed precision, for tight parity')
 ap.add_argument('--grad-ckpt', action='store_true')
@@ -57,15 +60,23 @@ def compare(tags):
         print(line)
     states = {t: torch.load(os.path.join(args.work_dir, f'{t}.pt'), map_location='cpu') for t in tags}
     ref = tags[0]
+    failed = False
     for t in tags[1:]:
         for key in ('model', 'model_ema'):
-            if key not in states[ref] or key not in states[t]:
+            if key not in states[ref] and key not in states[t]:
                 continue
+            assert key in states[ref] and key in states[t], f'{key} missing from one of {ref}, {t}'
             x, y = states[ref][key], states[t][key]
             assert x.keys() == y.keys(), f'state dict keys differ: {set(x) ^ set(y)}'
             num = sum((x[k].float() - y[k].float()).norm() ** 2 for k in x) ** 0.5
             den = sum(x[k].float().norm() ** 2 for k in x) ** 0.5
-            print(f'{key} rel diff {ref} vs {t}: {num / den:.2e}')
+            rel_diff = float(num / den.clamp_min(torch.finfo(den.dtype).tiny))
+            print(f'{key} rel diff {ref} vs {t}: {rel_diff:.2e}')
+            if not math.isfinite(rel_diff) or (
+                    args.max_param_rel_diff is not None and rel_diff > args.max_param_rel_diff):
+                failed = True
+    if failed:
+        raise SystemExit('Parameter comparison failed (non-finite difference or tolerance exceeded).')
 
 
 if args.compare:

@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 # model methods run outside forward() that must trigger FSDP all-gather / reshard like a forward
-_FSDP_FORWARD_METHODS = ('prefill', 'step')
+_FSDP_FORWARD_METHODS = ('encode_image', 'prefill', 'step')
 
 
 def _amp_dtype(cfg: TaskCfg):
@@ -79,6 +79,7 @@ class TrainingTask(nn.Module, abc.ABC):
         self.amp_dtype = _amp_dtype(cfg)
         self._fsdp_enabled = False
         self._fsdp_reshard_after_forward = True
+        self._full_params_roots = []  # modules currently held unsharded by full_params()
         self._compiled_training_forward = None
 
     @property
@@ -188,6 +189,10 @@ class TrainingTask(nn.Module, abc.ABC):
         assert not self._fsdp_enabled, 'Cannot wrap an FSDP2 sharded module w/ DDP, use FSDP or DDP, not both.'
         self.trainable_module = torch.nn.parallel.DistributedDataParallel(
             self.trainable_module, device_ids=device_ids, **ddp_kwargs)
+        if self.trainable_module_ema is not None:
+            # DDP broadcasts rank 0's params / buffers on wrap, an EMA copied before then holds this rank's (possibly
+            # different, rank seeded) init, re-copy so the EMA starts from the synchronized model on every rank
+            self.trainable_module_ema.set(self.get_trainable_module())
         return self
 
     def _get_fsdp_shard_modules(self) -> List[Tuple[str, nn.Module]]:
@@ -300,19 +305,30 @@ class TrainingTask(nn.Module, abc.ABC):
             return
         from torch.distributed.fsdp import FSDPModule
         root = self.get_trainable_module(use_ema)
-        root._get_fsdp_state()._lazy_init()
-        fsdp_modules = [m for m in root.modules() if isinstance(m, FSDPModule)]
-        for m in fsdp_modules:
-            m.set_reshard_after_forward(False, recurse=False)
-            m.unshard()
+        # Scopes for the same root nest, only the outermost unshards / reshards. An inner exit resharding would
+        # leave the outer scope (and has_full_params) claiming full params over sharded ones.
+        outermost = not any(m is root for m in self._full_params_roots)
+        fsdp_modules = []
+        if outermost:
+            root._get_fsdp_state()._lazy_init()
+            fsdp_modules = [m for m in root.modules() if isinstance(m, FSDPModule)]
+            for m in fsdp_modules:
+                m.set_reshard_after_forward(False, recurse=False)
+                m.unshard()
+        self._full_params_roots.append(root)
         try:
             yield
         finally:
+            self._full_params_roots.remove(root)  # one entry per scope
             restore = self._fsdp_reshard_after_forward if root is self.get_trainable_module() else True
             for m in fsdp_modules:
                 m.reshard()
                 if m is not root:  # the root keeps FSDP's default (no reshard after forward)
                     m.set_reshard_after_forward(restore, recurse=False)
+
+    def has_full_params(self, module: nn.Module) -> bool:
+        """ True if `module` (the model or its EMA) can run w/o collectives: no FSDP, or held by full_params(). """
+        return not self._fsdp_enabled or any(m is module for m in self._full_params_roots)
 
     # --- checkpoint state ---
     def _module_state_dict(self, module: nn.Module) -> Dict[str, Any]:

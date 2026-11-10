@@ -6,6 +6,7 @@ import torch.nn as nn
 
 from .config import ModelCfg, TextDecoderCfg
 from .image_encoder_timm import ImageEncoderTimm
+from .kv_cache import CrossMemory, DecodeState, LayerKVCache
 from .text_decoder import TextDecoder
 from .text_decoder_ettin import EttinTextDecoder
 from .text_decoder_qwen3 import Qwen3TextDecoder
@@ -86,39 +87,38 @@ class Cruller(nn.Module):
         layer_map.update(decoder_layer_map(self.text_decoder, 'text_decoder.'))
         return complete_layer_map(self, layer_map)
 
-    def prefill(self, image_input, prompt_ids: torch.Tensor, prompt_mask: torch.Tensor):
-        """ Encode image + (left padded) prompts, returns next token logits and decoding state. """
+    def encode_image(self, image_input: Union[torch.Tensor, Dict[str, torch.Tensor]]) -> CrossMemory:
+        """ Image -> per image decoding memory (encoder states prepared for cross-attention). Computed once per
+        image, shared by all prompts / beams decoded for it. """
         encoder_output, encoder_mask = self.encode(image_input)
-        cross_kv, cross_mask = self.text_decoder.prepare_cross(encoder_output, encoder_mask)
-        cache = [{} for _ in self.text_decoder.layers]
+        return self.text_decoder.prepare_cross(encoder_output, encoder_mask)
+
+    def prefill(self, memory: CrossMemory, prompt_ids: torch.Tensor, prompt_mask: torch.Tensor):
+        """ Run the (left padded) prompts, returns next token logits [N, V] and the decoding state.
+
+        N prompts may be a multiple of the memory's image batch (several prompts per image, image-major order).
+        """
+        cache = [LayerKVCache() for _ in self.text_decoder.layers]
         position_ids = (prompt_mask.long().cumsum(1) - 1).clamp(min=0)
         logits = self.text_decoder(
             prompt_ids,
-            cross_kv=cross_kv,
-            cross_mask=cross_mask,
+            cross_memory=memory,
             position_ids=position_ids,
             attention_mask=prompt_mask,
             cache=cache,
         )
-        state = dict(
-            cross_kv=cross_kv,
-            cross_mask=cross_mask,
-            cache=cache,
-            attn_mask=prompt_mask,
-            pos=position_ids[:, -1],
-        )
+        state = DecodeState(cache=cache, attn_mask=prompt_mask, pos=position_ids[:, -1], memory=memory)
         return logits[:, -1], state
 
-    def step(self, token_ids: torch.Tensor, state: Dict[str, Any]):
-        """ Decode one token per sample w/ cached state, returns next token logits and updated state. """
-        state['pos'] = state['pos'] + 1
-        state['attn_mask'] = torch.cat([state['attn_mask'], state['attn_mask'].new_ones(token_ids.shape)], dim=1)
+    def step(self, token_ids: torch.Tensor, state: DecodeState):
+        """ Decode one token per hypothesis w/ cached state, returns next token logits and the updated state. """
+        state.pos = state.pos + 1
+        state.attn_mask = torch.cat([state.attn_mask, state.attn_mask.new_ones(token_ids.shape)], dim=1)
         logits = self.text_decoder(
             token_ids,
-            cross_kv=state['cross_kv'],
-            cross_mask=state['cross_mask'],
-            position_ids=state['pos'][:, None],
-            attention_mask=state['attn_mask'],
-            cache=state['cache'],
+            cross_memory=state.memory,
+            position_ids=state.pos[:, None],
+            attention_mask=state.attn_mask,
+            cache=state.cache,
         )
         return logits[:, -1], state

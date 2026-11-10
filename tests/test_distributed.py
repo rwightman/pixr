@@ -99,3 +99,50 @@ def test_fsdp_matches_plain(process_group, model_name, grad_ckpt):
     # params are sharded again after full_params, training forward still works
     assert all(hasattr(p, 'full_tensor') for p in model.parameters())
     task(batch)[1]['loss'].backward()
+
+
+@pytest.mark.parametrize('model_name', ['cruller_naflex_siglip2_base', 'cronut_s16_tiktoken'])
+def test_fsdp_mixed_precision_generation_cache(process_group, model_name):
+    """ W/ a bf16 MixedPrecisionPolicy FSDP2 casts forward inputs by rebuilding containers, KV caches updated in
+    place inside a layer must survive (prefill fills every layer's cache, step decodes against it). """
+    from torch.distributed.fsdp import MixedPrecisionPolicy
+    task = _make_task(model_name)
+    batch = _batch(task)
+    task.prepare_fsdp(mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32))
+    model = task.get_trainable_module()
+    start = [[task.tokenizer.convert_tokens_to_ids(task.task_start_token)]] * 2
+    with torch.no_grad(), task.full_params():
+        ids = batch['text_input'][:, :3]
+        memory = model.encode_image(batch['image_input'])
+        logits, state = model.prefill(memory, ids, torch.ones_like(ids, dtype=torch.bool))
+        caches = tuple(state.cache)
+        prefix_len = batch['image_input']['patches'].shape[1] if model.cfg.type == 'cronut' else 0
+        for step in range(4):
+            for original, cache in zip(caches, state.cache):
+                assert cache is original
+                assert cache.k is not None and cache.v is not None
+                assert cache.k.shape[2] == cache.v.shape[2] == prefix_len + ids.shape[1]
+            expected = model(batch['image_input'], ids)[:, -1]
+            torch.testing.assert_close(logits, expected, atol=3e-2, rtol=1e-2)
+            if step < 3:
+                token = batch['text_input'][:, 3 + step:4 + step]
+                ids = torch.cat([ids, token], dim=1)
+                logits, state = model.step(token, state)
+        out = task.generate(batch['image_input'], start, [], 6)
+        # beam search: reorders the per layer caches every step, one beam must reproduce greedy
+        assert task.generate(batch['image_input'], start, [], 6, num_beams=1) == out
+        beams = task.generate(batch['image_input'], start, [], 6, num_beams=3)
+    assert [len(o) for o in out] == [6, 6]  # no stop tokens, every step decoded
+    assert [len(o) for o in beams] == [6, 6]
+    # sharded params: every prefill / step would be a collective, generation must be refused w/ a clear error
+    with pytest.raises(RuntimeError, match='full_params'):
+        task.generate(batch['image_input'], start, [], 6)
+    # nested scopes: the inner exit must not reshard under the outer scope
+    with torch.no_grad(), task.full_params():
+        with task.full_params():
+            assert task.has_full_params(model)
+        assert task.has_full_params(model)
+        assert not any(hasattr(p, 'full_tensor') for p in model.parameters())  # still unsharded
+        assert task.generate(batch['image_input'], start, [], 6) == out
+    assert not task.has_full_params(model)
+    assert all(hasattr(p, 'full_tensor') for p in model.parameters())  # resharded by the outermost exit

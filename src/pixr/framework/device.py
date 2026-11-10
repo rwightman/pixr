@@ -164,3 +164,13 @@ class DeviceEnv:
         objects = [None for _ in range(self.world_size)]
         dist.all_gather_object(objects, obj)
         return objects
+
+
+def destroy_distributed():
+    """ Tear down the default process group (if any) before interpreter exit.
+
+    W/o this, the NCCL watchdog thread can still be querying events while CUDA unloads at exit, crashing a rank
+    ('driver shutting down', SIGSEGV) after a successful run.
+    """
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()

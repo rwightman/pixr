@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from .config import ModelCfg
 from .cruller import create_text_decoder
 from .image_encoder_timm import ImageEncoderTimm
+from .kv_cache import DecodeState, LayerKVCache, PrefixMemory
 from .param_groups import block_modules, complete_layer_map, decoder_layer_map, timm_layer_map
 
 
@@ -154,9 +155,19 @@ class Fritter(nn.Module):
         layer_map.update(decoder_layer_map(self.text_decoder, 'text_decoder.'))
         return complete_layer_map(self, layer_map)
 
-    def prefill(self, image_input, prompt_ids: torch.Tensor, prompt_mask: torch.Tensor):
+    def encode_image(self, image_input: Union[torch.Tensor, Dict[str, torch.Tensor]]) -> PrefixMemory:
+        """ Image -> per image decoding memory (prefix embeddings + validity). """
         prefix, prefix_mask = self.encode(image_input)
-        cache = [{} for _ in self.text_decoder.layers]
+        return PrefixMemory(prefix, prefix_mask)
+
+    def prefill(self, memory: PrefixMemory, prompt_ids: torch.Tensor, prompt_mask: torch.Tensor):
+        """ Run [image prefix ; (left padded) prompts], returns next token logits [B, V] and the decoding state.
+
+        NOTE the image prefix K / V are part of the self-attention cache (per hypothesis), one prompt per image.
+        """
+        prefix, prefix_mask = memory.embeds, memory.mask
+        assert prompt_ids.shape[0] == prefix.shape[0], 'one prompt per image, expand the state for more hypotheses'
+        cache = [LayerKVCache() for _ in self.text_decoder.layers]
         attn_mask = torch.cat([prefix_mask, prompt_mask], dim=1)
         position_ids = (attn_mask.long().cumsum(1) - 1).clamp(min=0)
         logits = self.text_decoder(
@@ -166,17 +177,18 @@ class Fritter(nn.Module):
             attention_mask=attn_mask,
             cache=cache,
         )
-        state = dict(cache=cache, attn_mask=attn_mask, pos=position_ids[:, -1], prefix_len=prefix.shape[1])
+        state = DecodeState(
+            cache=cache, attn_mask=attn_mask, pos=position_ids[:, -1], memory=memory, prefix_len=prefix.shape[1])
         return logits[:, -1], state
 
-    def step(self, token_ids: torch.Tensor, state: Dict[str, Any]):
-        state['pos'] = state['pos'] + 1
-        state['attn_mask'] = torch.cat([state['attn_mask'], state['attn_mask'].new_ones(token_ids.shape)], dim=1)
+    def step(self, token_ids: torch.Tensor, state: DecodeState):
+        state.pos = state.pos + 1
+        state.attn_mask = torch.cat([state.attn_mask, state.attn_mask.new_ones(token_ids.shape)], dim=1)
         logits = self.text_decoder(
             token_ids,
-            position_ids=state['pos'][:, None],
-            attention_mask=state['attn_mask'],
-            cache=state['cache'],
-            prefix_len=state['prefix_len'],
+            position_ids=state.pos[:, None],
+            attention_mask=state.attn_mask,
+            cache=state.cache,
+            prefix_len=state.prefix_len,
         )
         return logits[:, -1], state
