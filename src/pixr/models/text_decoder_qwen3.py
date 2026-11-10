@@ -10,7 +10,7 @@ Vision style), so the decoder starts as the pretrained LM.
 import json
 import logging
 from dataclasses import replace
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -117,6 +117,9 @@ class Qwen3TextDecoder(nn.Module):
         pretrained_state = None
         if cfg.pretrained:
             cfg, pretrained_state = _load_hf_qwen3(cfg)
+        elif cfg.num_layers is None:
+            # unresolved config w/o pretrained weights, architecture from the hub config (random init)
+            cfg = _resolve_hf_qwen3_cfg(cfg, _load_hf_config(cfg.name))
         self.cfg = cfg
         self.dim = cfg.dim
         self.max_length = cfg.max_length
@@ -210,6 +213,7 @@ class Qwen3TextDecoder(nn.Module):
             prefix_mask: Optional[torch.Tensor] = None,
             prefix_len: Optional[int] = None,
             cross_mask: Optional[CrossAttnMask] = None,
+            return_hidden: bool = False,
     ) -> torch.Tensor:
         """ Same interface as EttinTextDecoder (prefix-LM and / or cross-attn), returns text position logits. """
         B, T = input_ids.shape
@@ -275,26 +279,29 @@ class Qwen3TextDecoder(nn.Module):
                 x = layer(x, rope, mask, is_causal, layer_cache, cross_kv[i], cross_mask)
 
         x = self.norm(x[:, P:])
-        return F.linear(x, self.embed_tokens.weight)
+        if return_hidden:
+            return x
+        weight, bias = self.lm_head_params()
+        return F.linear(x, weight, bias)
+
+    def lm_head_params(self):
+        """ Output projection (weight, bias) applied to `return_hidden` features. """
+        return self.embed_tokens.weight, None
 
 
-def _load_hf_qwen3(cfg: TextDecoderCfg) -> Tuple[TextDecoderCfg, Dict[str, torch.Tensor]]:
-    from huggingface_hub import hf_hub_download, list_repo_files
-    from safetensors.torch import load_file
+def _load_hf_config(name: str) -> Dict[str, Any]:
+    from huggingface_hub import hf_hub_download
+    with open(hf_hub_download(name, 'config.json')) as f:
+        return json.load(f)
 
-    with open(hf_hub_download(cfg.name, 'config.json')) as f:
-        hf_cfg = json.load(f)
+
+def _resolve_hf_qwen3_cfg(cfg: TextDecoderCfg, hf_cfg: Dict[str, Any]) -> TextDecoderCfg:
     assert hf_cfg.get('model_type') == 'qwen3', f"Unsupported model type {hf_cfg.get('model_type')}"
     assert hf_cfg.get('tie_word_embeddings', False), 'Untied output embeddings not supported yet.'
     assert not hf_cfg.get('use_sliding_window', False) and not hf_cfg.get('rope_scaling')
-    files = [f for f in list_repo_files(cfg.name) if f.endswith('.safetensors')]
-    state_dict = {}
-    for f in files:
-        state_dict.update(load_file(hf_hub_download(cfg.name, f)))
-
     num_layers = cfg.num_layers or hf_cfg['num_hidden_layers']
     assert num_layers <= hf_cfg['num_hidden_layers']
-    cfg = replace(
+    return replace(
         cfg,
         dim=hf_cfg['hidden_size'],
         num_heads=hf_cfg['num_attention_heads'],
@@ -308,6 +315,18 @@ def _load_hf_qwen3(cfg: TextDecoderCfg) -> Tuple[TextDecoderCfg, Dict[str, torch
         dropout=0.,
         attn_dropout=0.,
     )
+
+
+def _load_hf_qwen3(cfg: TextDecoderCfg) -> Tuple[TextDecoderCfg, Dict[str, torch.Tensor]]:
+    from huggingface_hub import hf_hub_download, list_repo_files
+    from safetensors.torch import load_file
+
+    cfg = _resolve_hf_qwen3_cfg(cfg, _load_hf_config(cfg.name))
+    num_layers = cfg.num_layers
+    files = [f for f in list_repo_files(cfg.name) if f.endswith('.safetensors')]
+    state_dict = {}
+    for f in files:
+        state_dict.update(load_file(hf_hub_download(cfg.name, f)))
     out = {}
     for k, v in state_dict.items():
         if not k.startswith('model.'):

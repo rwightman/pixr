@@ -10,7 +10,7 @@ pretrained LM.
 import json
 import logging
 from dataclasses import replace
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -140,6 +140,9 @@ class EttinTextDecoder(nn.Module):
         pretrained_state = None
         if cfg.pretrained:
             cfg, pretrained_state = _load_hf_ettin_decoder(cfg)
+        elif cfg.num_layers is None:
+            # unresolved config w/o pretrained weights, architecture from the hub config (random init)
+            cfg = _resolve_hf_ettin_cfg(cfg, _load_hf_config(cfg.name))
         self.cfg = cfg
         self.dim = cfg.dim
         self.max_length = cfg.max_length
@@ -247,6 +250,7 @@ class EttinTextDecoder(nn.Module):
             prefix_mask: Optional[torch.Tensor] = None,
             prefix_len: Optional[int] = None,
             cross_mask: Optional[CrossAttnMask] = None,
+            return_hidden: bool = False,
     ) -> torch.Tensor:
         """
         Args:
@@ -341,28 +345,30 @@ class EttinTextDecoder(nn.Module):
         x = x[:, P:]
         x = self.final_norm(x)
         x = self.head_norm(F.gelu(self.head_dense(x)))
-        return F.linear(x, self.embed_tokens.weight, self.output_bias)
+        if return_hidden:
+            return x
+        weight, bias = self.lm_head_params()
+        return F.linear(x, weight, bias)
+
+    def lm_head_params(self):
+        """ Output projection (weight, bias) applied to `return_hidden` features. """
+        return self.embed_tokens.weight, self.output_bias
 
 
-def _load_hf_ettin_decoder(cfg: TextDecoderCfg) -> Tuple[TextDecoderCfg, Dict[str, torch.Tensor]]:
-    from huggingface_hub import hf_hub_download, list_repo_files
+def _load_hf_config(name: str) -> Dict[str, Any]:
+    from huggingface_hub import hf_hub_download
+    with open(hf_hub_download(name, 'config.json')) as f:
+        return json.load(f)
 
-    with open(hf_hub_download(cfg.name, 'config.json')) as f:
-        hf_cfg = json.load(f)
-    files = list_repo_files(cfg.name)
-    if 'model.safetensors' in files:
-        from safetensors.torch import load_file
-        state_dict = load_file(hf_hub_download(cfg.name, 'model.safetensors'))
-    else:
-        state_dict = torch.load(hf_hub_download(cfg.name, 'pytorch_model.bin'), map_location='cpu', weights_only=True)
 
+def _resolve_hf_ettin_cfg(cfg: TextDecoderCfg, hf_cfg: Dict[str, Any]) -> TextDecoderCfg:
     assert hf_cfg.get('model_type') == 'modernbert-decoder', f"Unsupported model type {hf_cfg.get('model_type')}"
     assert hf_cfg.get('hidden_activation', 'gelu') == 'gelu' and hf_cfg.get('classifier_activation', 'gelu') == 'gelu'
     assert hf_cfg.get('global_rope_theta') == hf_cfg.get('local_rope_theta', hf_cfg.get('global_rope_theta')), \
         'Different global / local rope theta not supported.'
     num_layers = cfg.num_layers or hf_cfg['num_hidden_layers']
     assert num_layers <= hf_cfg['num_hidden_layers']
-    cfg = replace(
+    return replace(
         cfg,
         dim=hf_cfg['hidden_size'],
         num_heads=hf_cfg['num_attention_heads'],
@@ -376,6 +382,19 @@ def _load_hf_ettin_decoder(cfg: TextDecoderCfg) -> Tuple[TextDecoderCfg, Dict[st
         dropout=0.,
         attn_dropout=hf_cfg.get('attention_dropout', 0.),
     )
+
+
+def _load_hf_ettin_decoder(cfg: TextDecoderCfg) -> Tuple[TextDecoderCfg, Dict[str, torch.Tensor]]:
+    from huggingface_hub import hf_hub_download, list_repo_files
+
+    cfg = _resolve_hf_ettin_cfg(cfg, _load_hf_config(cfg.name))
+    num_layers = cfg.num_layers
+    files = list_repo_files(cfg.name)
+    if 'model.safetensors' in files:
+        from safetensors.torch import load_file
+        state_dict = load_file(hf_hub_download(cfg.name, 'model.safetensors'))
+    else:
+        state_dict = torch.load(hf_hub_download(cfg.name, 'pytorch_model.bin'), map_location='cpu', weights_only=True)
 
     out = {}
     for k, v in state_dict.items():
