@@ -101,13 +101,13 @@ class Trainer:
         self.optimizer = None
         self.scheduler = None
         self.scaler = None
-        self.task_wrapped = task  # DDP / compile wrapped task used for training forward
         self._rate_time = None
         self._rate_samples = 0
 
     @property
     def model(self):
-        return self.task.trainable_module
+        """ The unwrapped model (w/o DDP / compile wrappers). """
+        return self.task.get_trainable_module()
 
     @property
     def total_steps(self) -> int:
@@ -120,11 +120,7 @@ class Trainer:
             mean_batch_size: Optional[float] = None,
     ):
         self.mean_batch_size = mean_batch_size
-        self.task.to(self.device_env.device)
-        if self.cfg.grad_checkpointing:
-            self.model.set_grad_checkpointing()
-        if self.cfg.ema_decay:
-            self.task.setup_ema(self.cfg.ema_decay)
+        self._prepare_task()
 
         opt_cfg = self.cfg.opt
         opt_kwargs = {}
@@ -141,7 +137,10 @@ class Trainer:
             weight_decay=opt_cfg.weight_decay,
             **opt_kwargs,
         )
-        self.scaler = timm.utils.NativeScaler() if self.task.amp_dtype == torch.float16 else None
+        self.scaler = None
+        if self.task.amp_dtype == torch.float16:
+            assert not self.task.fsdp_enabled, 'FSDP w/ float16 is not supported, use bfloat16.'
+            self.scaler = timm.utils.NativeScaler()
 
         self.num_steps_per_interval = num_batches_per_interval // opt_cfg.grad_accum_steps
         warmup_steps = int(self.cfg.num_warmup_intervals * self.num_steps_per_interval)
@@ -164,12 +163,70 @@ class Trainer:
             _logger.info(f'Resumed from {resume} at interval {self.interval_idx}, step {self.step_idx}.')
         self.scheduler.step_update(self.step_idx)
 
+        if self.cfg.compile and self.cfg.compile_strategy == 'task':
+            _logger.info('Compiling task training forward.')
+            self.task.compile(target='task', **self._compile_kwargs())
+
+    def _compile_kwargs(self) -> Dict[str, Any]:
+        kwargs = dict(backend=self.cfg.compile_backend, mode=self.cfg.compile_mode, dynamic=self.cfg.compile_dynamic)
+        return {k: v for k, v in kwargs.items() if v is not None}
+
+    def _prepare_task(self):
+        """ Grad checkpointing, EMA, compile, and DDP / FSDP2 wrapping, ordered as per OpenCLIP's train setup. """
+        cfg = self.cfg
         task = self.task
-        if self.device_env.world_size > 1:
-            task = torch.nn.parallel.DistributedDataParallel(task, device_ids=[self.device_env.device])
-        if self.cfg.compile:
-            task = torch.compile(task)
-        self.task_wrapped = task
+        distributed = self.device_env.world_size > 1
+        use_fsdp = cfg.fsdp and distributed
+        if cfg.fsdp and not distributed:
+            _logger.warning('FSDP requires distributed mode, ignoring trainer.fsdp for single process training.')
+        assert cfg.compile_strategy in ('task', 'model', 'blocks'), f'Unknown compile strategy {cfg.compile_strategy}'
+        task.to(self.device_env.device)
+
+        if cfg.grad_checkpointing and not use_fsdp:
+            # w/ FSDP, composable AC is applied per block inside prepare_fsdp() (after per block compile)
+            self.model.set_grad_checkpointing()
+        if use_fsdp and cfg.compile and cfg.grad_checkpointing and torch.get_num_threads() > 1:
+            # DataLoader pin-memory threads call set_num_threads(1), which can also reach the autograd device thread.
+            # The checkpoint recompute then runs under a different thread count than the forward, recompiling the
+            # block and failing w/ a CheckpointError. torchrun avoids this by default by setting OMP_NUM_THREADS=1.
+            _logger.warning(
+                f'Reducing torch num_threads from {torch.get_num_threads()} to 1 to avoid a CheckpointError '
+                'w/ FSDP, compile, and grad checkpointing.')
+            torch.set_num_threads(1)
+
+        if cfg.ema_decay:
+            # before compile and distributed wrapping, so the copy is of the plain model
+            task.setup_ema(cfg.ema_decay)
+
+        compile_kwargs = self._compile_kwargs()
+        if cfg.compile and cfg.compile_strategy in ('model', 'blocks'):
+            if use_fsdp:
+                _logger.info(f'Compile strategy {cfg.compile_strategy} w/ FSDP uses prepare_fsdp() per block compile.')
+            else:
+                _logger.info(f'Compiling ({cfg.compile_strategy}) before distributed wrapping.')
+                task.compile(target=cfg.compile_strategy, **compile_kwargs)
+
+        if use_fsdp:
+            from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
+            # autocast is suppressed w/ FSDP, the policy casts params / forward inputs, gradients reduced in fp32
+            mp_policy = MixedPrecisionPolicy(param_dtype=task.amp_dtype, reduce_dtype=torch.float32)
+            _logger.info(f'FSDP2: MixedPrecisionPolicy(param_dtype={task.amp_dtype}, reduce_dtype=torch.float32).')
+            task.prepare_fsdp(
+                reshard_after_forward=cfg.fsdp_reshard_after_forward,
+                mp_policy=mp_policy,
+                offload_policy=CPUOffloadPolicy() if cfg.fsdp_offload_cpu else None,
+                compile_blocks=cfg.compile,
+                compile_kwargs=compile_kwargs,
+                grad_checkpointing=cfg.grad_checkpointing,
+            )
+        elif distributed:
+            if cfg.compile:
+                # The DDP dynamo optimizer splits the graph into submodules at gradient-bucket boundaries. That breaks
+                # under grad checkpointing and dynamic cross-bucket sequence lengths (NaFlex patches + variable text
+                # length), Inductor can't recover the symbol ("expected [sN] to have been codegen-ed"). Disable the
+                # split so the whole forward compiles as one symbol-consistent graph.
+                torch._dynamo.config.optimize_ddp = False
+            task.prepare_distributed(device_ids=[self.device_env.device])
 
     def _loss_scale(self, batch) -> float:
         mode = self.cfg.opt.loss_batch_scale
@@ -196,7 +253,8 @@ class Trainer:
     def train_interval(self, loader) -> Dict[str, float]:
         opt_cfg = self.cfg.opt
         accum = opt_cfg.grad_accum_steps
-        has_no_sync = hasattr(self.task_wrapped, 'no_sync')
+        ddp_module = self.task.trainable_module
+        has_no_sync = isinstance(ddp_module, torch.nn.parallel.DistributedDataParallel)
         self.task.train()
         self.optimizer.zero_grad(set_to_none=True)
         start = time.time()
@@ -207,14 +265,20 @@ class Trainer:
             num_samples += batch_size
             self._rate_samples += batch_size
             need_update = (interval_batch_idx + 1) % accum == 0
-            sync_ctx = self.task_wrapped.no_sync if (has_no_sync and not need_update) else nullcontext
+            # disable gradient sync for all but the last accumulation step, FSDP2: set_requires_gradient_sync,
+            # DDP: no_sync context manager
+            if not need_update:
+                self.task.set_requires_gradient_sync(False)
+            sync_ctx = ddp_module.no_sync if (has_no_sync and not need_update) else nullcontext
             with sync_ctx():
                 with self.task.autocast():
-                    outputs, losses = self.task_wrapped(batch)
+                    outputs, losses = self.task(batch)
                 loss = losses['loss'] * self._loss_scale(batch)
                 if accum > 1:
                     loss = loss / accum
                 self._backward(loss, need_update)
+            if not need_update:
+                self.task.set_requires_gradient_sync(True)
             self.batch_idx += 1
             if not need_update:
                 continue
@@ -244,17 +308,20 @@ class Trainer:
         loss.backward()
         if need_update:
             if self.cfg.opt.clip_grad_value is not None:
+                # clip_grad_norm_ handles FSDP2 DTensor grads (the total norm is reduced across shards)
                 timm.utils.dispatch_clip_grad(params, value=self.cfg.opt.clip_grad_value, mode=self.cfg.opt.clip_grad_mode)
             self.optimizer.step()
 
     def _after_step(self, batch, outputs, losses):
         metrics = None
         eval_data = None
-        if self.cfg.metrics_frequency and self.step_idx % self.cfg.metrics_frequency == 0 and \
-                self.device_env.is_primary():
-            result = self.task.train_metrics(batch, outputs)
-            if result is not None:
-                metrics, eval_data = result
+        if self.cfg.metrics_frequency and self.step_idx % self.cfg.metrics_frequency == 0:
+            # w/ FSDP all ranks gather the full params (collective), then the primary runs the metrics alone
+            with self.task.full_params():
+                if self.device_env.is_primary():
+                    result = self.task.train_metrics(batch, outputs)
+                    if result is not None:
+                        metrics, eval_data = result
         if self.monitor is not None and (metrics is not None or self.step_idx % self.cfg.log_frequency == 0):
             extra = {k: v.item() for k, v in losses.items() if k != 'loss' and torch.is_tensor(v)}
             self.monitor.log_step(
@@ -269,9 +336,30 @@ class Trainer:
                 eval_data=eval_data,
             )
 
+    def _optimizer_state_dict(self) -> Dict[str, Any]:
+        if not self.task.fsdp_enabled:
+            return self.optimizer.state_dict()
+        from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict, StateDictOptions
+        options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+        return get_optimizer_state_dict(self.model, self.optimizer, options=options)
+
+    def _load_optimizer_state_dict(self, state: Dict[str, Any]):
+        # FSDP optimizer state is keyed by param name, DDP / single device by param index, not interchangeable
+        fqn_keyed = any(isinstance(k, str) for k in state.get('state', {}))
+        if fqn_keyed != self.task.fsdp_enabled:
+            _logger.warning('Optimizer state saved w/ a different FSDP / DDP setting, not restored.')
+            return
+        if not self.task.fsdp_enabled:
+            self.optimizer.load_state_dict(state)
+            return
+        from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict, StateDictOptions
+        set_optimizer_state_dict(
+            self.model, self.optimizer, optim_state_dict=state, options=StateDictOptions(full_state_dict=True))
+
     def state_dict(self) -> Dict[str, Any]:
+        """ Train state, w/ FSDP this is a collective (call on all ranks) and is only populated on rank 0. """
         state = self.task.model_state_dict()
-        state['optimizer'] = self.optimizer.state_dict()
+        state['optimizer'] = self._optimizer_state_dict()
         state['scheduler'] = self.scheduler.state_dict()
         if self.scaler is not None:
             state['scaler'] = self.scaler.state_dict()
@@ -282,7 +370,7 @@ class Trainer:
     def load_state_dict(self, state: Dict[str, Any]):
         self.task.load_model_state_dict(state)
         if 'optimizer' in state:
-            self.optimizer.load_state_dict(state['optimizer'])
+            self._load_optimizer_state_dict(state['optimizer'])
         # NOTE the LR schedule is not restored from the checkpoint, it is fully determined by the current config +
         # step_idx (restoring timm scheduler state would revert the schedule length if num_intervals changed)
         if 'scaler' in state and self.scaler is not None:

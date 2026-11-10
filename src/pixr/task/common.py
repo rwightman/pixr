@@ -106,7 +106,7 @@ class ImageTextTask(TrainingTask):
         self.image_preprocess_factory = ImagePreprocessorFactory(self.input_info, True, cfg.image_transforms)
 
     def extra_state(self) -> Dict[str, Any]:
-        return checkpoint_extra_state(self.trainable_module, self.tokenizer, self.task_name)
+        return checkpoint_extra_state(self.get_trainable_module(), self.tokenizer, self.task_name)
 
     def lm_loss(self, batch: Dict[str, Any]):
         """ Teacher forced next token cross-entropy on text targets (masked w/ -100), optional z-loss.
@@ -114,13 +114,15 @@ class ImageTextTask(TrainingTask):
         Returns (outputs, losses), w/ the fused (chunked) LM head + CE the full logits are never materialized.
         """
         text_input, text_target = trim_padding(batch['text_input'], batch['text_target'], self.pad_token_id)
-        model = self.trainable_module
+        model = self.trainable_module  # possibly DDP / compile wrapped, for the forward
         target = text_target[:, 1:]
         z_loss = self.cfg.z_loss_weight > 0
         outputs = {}
         if self.cfg.loss_chunk_size > 0:
             hidden = model(batch['image_input'], text_input[:, :-1], return_hidden=True)
-            weight, bias = model.lm_head_params()
+            # outside the model forward, w/ FSDP2 the root's params (incl. the LM head / tied embedding) stay
+            # unsharded after forward until backward
+            weight, bias = self.get_trainable_module().lm_head_params()
             ce, z = fused_linear_cross_entropy(
                 hidden.flatten(0, 1),
                 weight,

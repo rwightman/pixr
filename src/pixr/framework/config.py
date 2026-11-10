@@ -56,5 +56,21 @@ class TrainerCfg:
     metrics_frequency: int = 1000  # calculate (expensive) task train metrics every n steps, 0 disables
     opt: OptimizationCfg = field(default_factory=OptimizationCfg)
     grad_checkpointing: bool = False
-    compile: bool = False
     ema_decay: Optional[float] = None  # enable EMA of model weights w/ this decay
+
+    # torch.compile, strategy (as per OpenCLIP --torchcompile-strategy):
+    #   'task': compile the task training forward (model + loss), after distributed wrapping
+    #   'model': compile the model before DDP wrapping
+    #   'blocks': compile blocks in place before DDP wrapping, grad checkpoint recompute stays in eager autograd
+    #     (bounds compiled backward memory when whole-graph compile schedules checkpointed recomputes poorly)
+    # w/ FSDP, blocks are always compiled per block inside prepare_fsdp() (compile -> composable AC -> FSDP)
+    compile: bool = False
+    compile_strategy: str = 'task'
+    compile_backend: Optional[str] = None
+    compile_mode: Optional[str] = None
+    compile_dynamic: Optional[bool] = None
+
+    # FSDP2 (fully_shard) instead of DDP for distributed training (params / grads / optimizer state sharded)
+    fsdp: bool = False
+    fsdp_reshard_after_forward: bool = True  # False keeps block params gathered from forward to backward
+    fsdp_offload_cpu: bool = False

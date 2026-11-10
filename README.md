@@ -108,12 +108,34 @@ Apps are configured by dataclasses parsed w/ [jsonargparse](https://github.com/o
 * `--task read|docvqa` selects the task (and the type of the `task` config section), default `read` for train
 * nested fields map to dotted args, written w/ dashes: `--trainer.opt.learning-rate 1e-4` (underscores also accepted)
   * `--task.*` -- task: model, tokenizer, image transforms, dtype / amp, max text length, eval generation
-  * `--trainer.*` -- optimization: intervals, warmup, optimizer / schedule (`--trainer.opt.*`), EMA, compile, grad ckpt
+  * `--trainer.*` -- optimization: intervals, warmup, optimizer / schedule (`--trainer.opt.*`), EMA, compile, grad ckpt,
+    FSDP
   * `--train-data.*` / `--eval-data.*` -- chugr data args (source, format, split, batch size, workers, NaFlex batching)
 * `--config file.yaml` loads a config (CLI args override), `--print-config` dumps the resolved config, `--help` lists all
 * lists are passed as `--train-data.naflex-seq-lens [1024,2048,4096]`
 
 The full resolved config is written to `<output_dir>/<experiment>/config.yaml` and can be passed back via `--config`.
+
+### Distributed / compile
+
+Distributed runs (`torch.distributed.run`) use DDP by default, `--trainer.fsdp true` shards params, grads and
+optimizer state w/ FSDP2 (`fully_shard` per encoder block / decoder layer + root, models list their blocks in
+`fsdp_shard_modules()`). The handling follows the OpenCLIP `TrainingTask` (`prepare_distributed` / `prepare_fsdp` /
+`compile` on the task):
+
+* FSDP mixed precision is a `MixedPrecisionPolicy` (bf16 params, fp32 gradient reduction), autocast is suppressed
+* `--trainer.grad-checkpointing` w/ FSDP applies composable activation checkpointing per block (inline otherwise)
+* `--trainer.compile true --trainer.compile-strategy task|model|blocks`: `task` compiles the task training forward
+  (model + loss), `model` the model before DDP, `blocks` the blocks in place before DDP (checkpoint recompute stays
+  in eager autograd, bounding compiled backward memory). W/ FSDP, blocks are always compiled inside `prepare_fsdp()`,
+  ordered compile -> composable checkpointing -> `fully_shard` (checkpoint hooks on the compiled wrapper so recompute
+  re-enters the FSDP all-gather hooks), `--compile-mode` / `--compile-dynamic` / `--compile-backend` pass through
+* eval and train metrics run w/ the params gathered (`task.full_params()`), so ranks decode independently
+* checkpoints are gathered full state dicts (model, EMA, optimizer), loadable w/o FSDP, model / EMA weights are
+  interchangeable between FSDP and DDP runs (optimizer state is not)
+
+`scripts/check_distributed.py` checks single / DDP / FSDP parity (loss trajectories, final params), grad
+checkpointing, accumulation, compile, EMA, resume and generation through the Trainer on synthetic batches.
 
 ### LR scaling
 
@@ -156,7 +178,8 @@ Within `src/pixr`:
 * `data/` - data loaders, image and text preprocessing
 * `framework/` - lightweight train & evaluation scaffolding on top of canonical PyTorch
   * `framework/task.py` - `TrainingTask` base (model + objective + eval)
-  * `framework/trainer.py` - `Trainer` (optimizer, LR schedule, AMP, grad accumulation, DDP / compile, EMA, train state)
+  * `framework/trainer.py` - `Trainer` (optimizer, LR schedule, AMP, grad accumulation, DDP / FSDP2 / compile setup,
+    EMA, train state)
 * `models/` - modelling code with associated factory methods and helpers
 * `task/` - tasks (`read` pretraining, `docvqa` fine-tune), registered in `task/task_registry.py`
 * `tokenizers/` - tokenizer creation and task token handling
@@ -184,7 +207,7 @@ With the Task concept, the data pipeline exists outside the task. The data pipel
 
 A task is a `TrainingTask` (an `nn.Module` wrapping the model) implementing `training_forward(batch) -> (outputs, losses)`,
 optional `train_metrics()`, and `evaluate(loader)`. The generic `Trainer` owns everything else (optimizer, schedule,
-AMP, accumulation, DDP of the task module, compile, EMA, checkpointing state). Tasks are agnostic to the model family,
+AMP, accumulation, setup ordering for DDP / FSDP2 / compile, EMA, checkpointing state). Tasks are agnostic to the model family,
 Cruller, Fritter and Cronut share the same `prefill` / `step` generation interface.
 
 ### Interval

@@ -12,7 +12,7 @@ import os
 import sys
 from dataclasses import dataclass, field, replace
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 import torch
 
@@ -52,10 +52,10 @@ class TrainCfg(Serializable):
     log_eval_data: bool = False
 
 
-def _save_checkpoint(trainer: Trainer, checkpoint_dir: str, interval: int, keep: int):
+def _save_checkpoint(state: Dict[str, Any], checkpoint_dir: str, interval: int, keep: int):
     path = os.path.join(checkpoint_dir, f'checkpoint-{interval}.pt')
     tmp_path = path + '.tmp'
-    torch.save(trainer.state_dict(), tmp_path)
+    torch.save(state, tmp_path)
     os.replace(tmp_path, path)
     latest = os.path.join(checkpoint_dir, 'checkpoint-latest.pt')
     if os.path.lexists(latest):
@@ -158,15 +158,20 @@ def main(argv=None):
 
         last = interval + 1 == train_cfg.trainer.num_intervals
         if eval_loader is not None and ((interval + 1) % train_cfg.eval_frequency == 0 or last):
-            eval_metrics = task.evaluate(eval_loader.loader, use_ema=train_cfg.eval_ema)
+            # w/ FSDP, params are gathered for eval so each rank decodes its eval shard independently
+            with task.full_params(use_ema=train_cfg.eval_ema):
+                eval_metrics = task.evaluate(eval_loader.loader, use_ema=train_cfg.eval_ema)
             results['eval'] = eval_metrics
             monitor.log_phase('eval', interval=interval, **eval_metrics)
 
         if device_env.is_primary():
             monitor.write_summary(results, index=interval)
-            if (interval + 1) % train_cfg.checkpoint_frequency == 0 or last:
-                path = _save_checkpoint(trainer, checkpoint_dir, interval, train_cfg.checkpoint_keep)
+        if (interval + 1) % train_cfg.checkpoint_frequency == 0 or last:
+            state = trainer.state_dict()  # collective w/ FSDP
+            if device_env.is_primary():
+                path = _save_checkpoint(state, checkpoint_dir, interval, train_cfg.checkpoint_keep)
                 _logger.info(f'Saved checkpoint {path}')
+            del state
 
 
 if __name__ == '__main__':
