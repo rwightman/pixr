@@ -57,14 +57,20 @@ class Cruller(nn.Module):
             self,
             image_input: Union[torch.Tensor, Dict[str, torch.Tensor]],
             text_input: torch.Tensor,
+            return_hidden: bool = False,
     ) -> torch.Tensor:
-        """ Teacher forced forward, returns logits [B, T, V]. """
+        """ Teacher forced forward, returns logits [B, T, V] (or pre-head features [B, T, D] w/ return_hidden). """
         encoder_output, encoder_mask = self.image_encoder(image_input)
         return self.text_decoder(
             text_input,
             encoder_hidden_states=encoder_output,
             encoder_mask=encoder_mask,
+            return_hidden=return_hidden,
         )
+
+    def lm_head_params(self):
+        """ Output projection (weight, bias) applied to `forward(..., return_hidden=True)` features. """
+        return self.text_decoder.lm_head_params()
 
     def prefill(self, image_input, prompt_ids: torch.Tensor, prompt_mask: torch.Tensor):
         """ Encode image + (left padded) prompts, returns next token logits and decoding state. """

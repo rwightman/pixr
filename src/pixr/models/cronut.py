@@ -272,7 +272,11 @@ class Cronut(nn.Module):
     def _logits(self, x):
         return self.lm_head(self.out_proj(x))
 
-    def _prefix_forward(self, image_input, text_ids, text_mask, cache=None):
+    def lm_head_params(self):
+        """ Output projection (weight, bias) applied to `forward(..., return_hidden=True)` features. """
+        return self.lm_head.weight, self.lm_head.bias
+
+    def _prefix_forward(self, image_input, text_ids, text_mask, cache=None, return_hidden=False):
         """ Run [image ; text] through the trunk, returns text position logits and the final text positions. """
         assert isinstance(image_input, dict), 'Cronut requires NaFlex (patch dict) image input.'
         img = self.image_encoder(image_input['patches'])
@@ -286,17 +290,20 @@ class Cronut(nn.Module):
         cos, sin = self.rotary(pos, x.dtype)
         key_valid = torch.cat([patch_valid, text_mask.bool()], dim=1)
         x = self._run(x, cos, sin, self._attn_mask(key_valid, P, x), cache=cache)
-        return self._logits(x[:, P:]), key_valid, txt_pos[:, -1]
+        x = x[:, P:]
+        x = self.out_proj(x) if return_hidden else self._logits(x)
+        return x, key_valid, txt_pos[:, -1]
 
     def forward(
             self,
             image_input: Dict[str, torch.Tensor],
             text_input: torch.Tensor,
+            return_hidden: bool = False,
     ) -> torch.Tensor:
-        """ Teacher forced forward, returns text logits [B, T, V]. """
+        """ Teacher forced forward, returns text logits [B, T, V] (or pre-head features w/ return_hidden). """
         text_mask = torch.ones_like(text_input, dtype=torch.bool)  # right padded text, causal attention
-        logits, _, _ = self._prefix_forward(image_input, text_input, text_mask)
-        return logits
+        out, _, _ = self._prefix_forward(image_input, text_input, text_mask, return_hidden=return_hidden)
+        return out
 
     def prefill(self, image_input, prompt_ids: torch.Tensor, prompt_mask: torch.Tensor):
         cache = [{} for _ in self.layers]

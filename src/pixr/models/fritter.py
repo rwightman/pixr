@@ -129,10 +129,16 @@ class Fritter(nn.Module):
             self,
             image_input: Union[torch.Tensor, Dict[str, torch.Tensor]],
             text_input: torch.Tensor,
+            return_hidden: bool = False,
     ) -> torch.Tensor:
-        """ Teacher forced forward, returns text logits [B, T, V]. """
+        """ Teacher forced forward, returns text logits [B, T, V] (or pre-head features w/ return_hidden). """
         prefix, prefix_mask = self.encode(image_input)
-        return self.text_decoder(text_input, prefix_embeds=prefix, prefix_mask=prefix_mask)
+        return self.text_decoder(
+            text_input, prefix_embeds=prefix, prefix_mask=prefix_mask, return_hidden=return_hidden)
+
+    def lm_head_params(self):
+        """ Output projection (weight, bias) applied to `forward(..., return_hidden=True)` features. """
+        return self.text_decoder.lm_head_params()
 
     def prefill(self, image_input, prompt_ids: torch.Tensor, prompt_mask: torch.Tensor):
         prefix, prefix_mask = self.encode(image_input)

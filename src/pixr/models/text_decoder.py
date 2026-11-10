@@ -264,6 +264,7 @@ class TextDecoder(nn.Module):
             attention_mask: Optional[torch.Tensor] = None,
             cache: Optional[List[Dict[str, torch.Tensor]]] = None,
             cross_mask: Optional[CrossAttnMask] = None,
+            return_hidden: bool = False,
     ) -> torch.Tensor:
         """
         Args:
@@ -315,8 +316,14 @@ class TextDecoder(nn.Module):
             else:
                 x = layer(x, cross_kv[i], cross_mask=cross_mask, self_mask=self_mask, cache=layer_cache)
 
-        logits = F.linear(x, self.embed_tokens.weight)  # tied output projection (as BartForCausalLM)
-        return logits
+        if return_hidden:
+            return x
+        weight, bias = self.lm_head_params()
+        return F.linear(x, weight, bias)
+
+    def lm_head_params(self):
+        """ Output projection (weight, bias) applied to `return_hidden` features. """
+        return self.embed_tokens.weight, None  # tied output projection (as BartForCausalLM)
 
 
 def resize_pos_embed(weight: torch.Tensor, new_len: int) -> torch.Tensor:

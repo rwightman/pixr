@@ -11,6 +11,7 @@ from pixr.data import create_image_preprocessor, ImagePreprocessorFactory
 from pixr.framework import DeviceEnv, TaskCfg, TrainingTask
 from pixr.framework.task import move_to_device
 from pixr.generation import generate_greedy
+from pixr.loss import fused_linear_cross_entropy, lm_cross_entropy
 from pixr.models import ModelArgs, ModelCfg, Cruller, create_model, load_model_state
 from pixr.tokenizers import TokenizerCfg, create_tokenizer, get_added_tokens
 from pixr.utils import load_checkpoint
@@ -108,20 +109,40 @@ class ImageTextTask(TrainingTask):
         return checkpoint_extra_state(self.trainable_module, self.tokenizer, self.task_name)
 
     def lm_loss(self, batch: Dict[str, Any]):
-        """ Teacher forced next token cross-entropy on text targets (masked w/ -100). """
+        """ Teacher forced next token cross-entropy on text targets (masked w/ -100), optional z-loss.
+
+        Returns (outputs, losses), w/ the fused (chunked) LM head + CE the full logits are never materialized.
+        """
         text_input, text_target = trim_padding(batch['text_input'], batch['text_target'], self.pad_token_id)
-        logits = self.trainable_module(batch['image_input'], text_input[:, :-1])
-        loss = F.cross_entropy(
-            logits.flatten(0, 1),
-            text_target[:, 1:].flatten(),
-            ignore_index=-100,
-            label_smoothing=self.cfg.label_smoothing,
-        )
-        return logits, loss
+        model = self.trainable_module
+        target = text_target[:, 1:]
+        z_loss = self.cfg.z_loss_weight > 0
+        outputs = {}
+        if self.cfg.loss_chunk_size > 0:
+            hidden = model(batch['image_input'], text_input[:, :-1], return_hidden=True)
+            weight, bias = model.lm_head_params()
+            ce, z = fused_linear_cross_entropy(
+                hidden.flatten(0, 1),
+                weight,
+                target.flatten(),
+                bias=bias,
+                chunk_size=self.cfg.loss_chunk_size,
+                z_loss=z_loss,
+                label_smoothing=self.cfg.label_smoothing,
+            )
+        else:
+            outputs['logits'] = model(batch['image_input'], text_input[:, :-1])
+            ce, z = lm_cross_entropy(
+                outputs['logits'], target, z_loss=z_loss, label_smoothing=self.cfg.label_smoothing)
+        losses = {'loss': ce}
+        if z is not None:
+            losses['loss'] = ce + self.cfg.z_loss_weight * z
+            losses['ce_loss'] = ce
+            losses['z_loss'] = z
+        return outputs, losses
 
     def training_forward(self, batch: Dict[str, Any]):
-        logits, loss = self.lm_loss(batch)
-        return {'logits': logits}, {'loss': loss}
+        return self.lm_loss(batch)
 
     @torch.no_grad()
     def generate(self, image_input, prompts: Sequence[Sequence[int]], stop_token_ids, max_new_tokens: int,

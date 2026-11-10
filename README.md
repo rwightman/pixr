@@ -115,6 +115,13 @@ Apps are configured by dataclasses parsed w/ [jsonargparse](https://github.com/o
 
 The full resolved config is written to `<output_dir>/<experiment>/config.yaml` and can be passed back via `--config`.
 
+### LM loss
+
+The LM head + cross-entropy is fused and chunked over tokens by default (`--task.loss-chunk-size 4096`, 0 to
+materialize full logits), padding is dropped before the head GEMM and each chunk's logits are recomputed in backward,
+so the [tokens, vocab] logits (~150k vocab for Qwen3) are never materialized. `--task.z-loss-weight` (e.g. `1e-4`) adds
+a z-loss (mean squared logsumexp), `--task.label-smoothing` is supported by both paths.
+
 ### NaFlex batching
 
 For NaFlex models the train loader can draw a sequence length per batch and size the batch to a token budget, w/

@@ -14,6 +14,8 @@ class TaskCfg:
     dtype: Optional[str] = 'bfloat16'  # low precision dtype for autocast ('bfloat16' or 'float16')
     amp: bool = True
     label_smoothing: float = 0.
+    z_loss_weight: float = 0.  # weight of the LM z-loss (mean logsumexp(logits) ** 2), e.g. 1e-4
+    loss_chunk_size: int = 4096  # fused (chunked) LM head + CE, tokens per chunk, 0 to materialize full logits
 
 
 @dataclass
