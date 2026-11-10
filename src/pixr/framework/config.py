@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 from pixr.models import ModelArgs
 from pixr.tokenizers import TokenizerCfg
@@ -32,8 +32,16 @@ class OptimizationCfg:
     grad_accum_steps: int = 1
     momentum: Optional[float] = None
     betas: Optional[Tuple[float, float]] = (0.9, 0.98)
-    layer_decay: Optional[float] = None
-    encoder_lr_scale: float = 1.0  # LR multiplier for the (pretrained) image encoder
+    # per component LR multipliers (components defined by the model's param_layer_map(): 'encoder' == image
+    # encoder, 'bridge' == cross-attention / prefix projector, 'decoder' == text decoder / LM trunk)
+    encoder_lr_scale: float = 1.0
+    bridge_lr_scale: float = 1.0
+    decoder_lr_scale: float = 1.0
+    # layer-wise LR decay within the encoder / decoder (scale = decay ** (top layer - layer id)), None disables
+    encoder_layer_decay: Optional[float] = None
+    decoder_layer_decay: Optional[float] = None
+    # extra multipliers by param name regex (re.search, first match wins), e.g. {'embed_tokens': 2.0}
+    lr_scale_overrides: Optional[Dict[str, float]] = None
     # scale loss by batch size relative to the mean for variable batch size (NaFlex schedule) loaders,
     # 'none', 'linear' (per-sample gradient weight constant) or 'sqrt'
     loss_batch_scale: str = 'none'

@@ -115,6 +115,16 @@ Apps are configured by dataclasses parsed w/ [jsonargparse](https://github.com/o
 
 The full resolved config is written to `<output_dir>/<experiment>/config.yaml` and can be passed back via `--config`.
 
+### LR scaling
+
+Params are grouped by component via the model's `param_layer_map()`: `encoder` (image encoder), `bridge`
+(cross-attention / prefix projector), `decoder` (text decoder / LM trunk). Each has an LR multiplier
+(`--trainer.opt.encoder-lr-scale`, `--trainer.opt.bridge-lr-scale`, `--trainer.opt.decoder-lr-scale`) and the
+encoder / decoder support layer-wise LR decay (`--trainer.opt.encoder-layer-decay 0.75`,
+`--trainer.opt.decoder-layer-decay`). `--trainer.opt.lr-scale-overrides '{"embed_tokens": 2.0}'` adds multipliers
+by param name regex. Training pretrained encoders at full LR from the start wrecks their features before the decoder
+learns to use them (reading never takes off), `scripts/pretrain_idl.sh` uses `ENC_LR_SCALE=0.1`.
+
 ### LM loss
 
 The LM head + cross-entropy is fused and chunked over tokens by default (`--task.loss-chunk-size 4096`, 0 to

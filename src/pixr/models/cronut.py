@@ -24,6 +24,7 @@ from timm.layers import DropPath
 
 from .attention import build_prefix_lm_block_mask, self_attention, has_flex
 from .config import CronutCfg, ImageEncoderCfg, ModelCfg
+from .param_groups import decoder_layer_map
 
 _ACT = {'silu': F.silu, 'gelu': F.gelu}
 
@@ -275,6 +276,16 @@ class Cronut(nn.Module):
     def lm_head_params(self):
         """ Output projection (weight, bias) applied to `forward(..., return_hidden=True)` features. """
         return self.lm_head.weight, self.lm_head.bias
+
+    def param_layer_map(self):
+        """ {param name: (component, layer id, num layers)} for per component LR scales / layer-wise LR decay.
+
+        The patch embed is the 'encoder' component, the shared trunk (+ text embed / head) the 'decoder'.
+        """
+        layer_map = decoder_layer_map(self, '', bridge=False, bottom=('text_embed', 'in_proj', 'text_norm_pre'))
+        for n, _ in self.image_encoder.named_parameters():
+            layer_map['image_encoder.' + n] = ('encoder', 0, 1)
+        return layer_map
 
     def _prefix_forward(self, image_input, text_ids, text_mask, cache=None, return_hidden=False):
         """ Run [image ; text] through the trunk, returns text position logits and the final text positions. """

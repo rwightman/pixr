@@ -9,6 +9,7 @@ from .image_encoder_timm import ImageEncoderTimm
 from .text_decoder import TextDecoder
 from .text_decoder_ettin import EttinTextDecoder
 from .text_decoder_qwen3 import Qwen3TextDecoder
+from .param_groups import complete_layer_map, decoder_layer_map, timm_layer_map
 
 
 def create_text_decoder(cfg: TextDecoderCfg, vocab_size: int, pad_token_id: int):
@@ -71,6 +72,12 @@ class Cruller(nn.Module):
     def lm_head_params(self):
         """ Output projection (weight, bias) applied to `forward(..., return_hidden=True)` features. """
         return self.text_decoder.lm_head_params()
+
+    def param_layer_map(self):
+        """ {param name: (component, layer id, num layers)} for per component LR scales / layer-wise LR decay. """
+        layer_map = timm_layer_map(self.image_encoder.trunk, 'image_encoder.trunk.')
+        layer_map.update(decoder_layer_map(self.text_decoder, 'text_decoder.'))
+        return complete_layer_map(self, layer_map)
 
     def prefill(self, image_input, prompt_ids: torch.Tensor, prompt_mask: torch.Tensor):
         """ Encode image + (left padded) prompts, returns next token logits and decoding state. """

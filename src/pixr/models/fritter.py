@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from .config import ModelCfg
 from .cruller import create_text_decoder
 from .image_encoder_timm import ImageEncoderTimm
+from .param_groups import complete_layer_map, decoder_layer_map, timm_layer_map
 
 
 def merge_patch_tokens(
@@ -139,6 +140,12 @@ class Fritter(nn.Module):
     def lm_head_params(self):
         """ Output projection (weight, bias) applied to `forward(..., return_hidden=True)` features. """
         return self.text_decoder.lm_head_params()
+
+    def param_layer_map(self):
+        """ {param name: (component, layer id, num layers)} for per component LR scales / layer-wise LR decay. """
+        layer_map = timm_layer_map(self.image_encoder.trunk, 'image_encoder.trunk.')
+        layer_map.update(decoder_layer_map(self.text_decoder, 'text_decoder.'))
+        return complete_layer_map(self, layer_map)
 
     def prefill(self, image_input, prompt_ids: torch.Tensor, prompt_mask: torch.Tensor):
         prefix, prefix_mask = self.encode(image_input)

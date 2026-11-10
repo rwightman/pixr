@@ -1,6 +1,7 @@
 """ Trainer: optimization loop for a TrainingTask (optimizer, schedule, AMP, accumulation, DDP / compile, EMA,
 logging, and train state checkpointing). """
 import logging
+import re
 import time
 from contextlib import nullcontext
 from typing import Any, Dict, Optional
@@ -11,7 +12,7 @@ import timm.utils
 from timm.optim import create_optimizer_v2
 from timm.scheduler import create_scheduler_v2
 
-from .config import TrainerCfg
+from .config import OptimizationCfg, TrainerCfg
 from .device import DeviceEnv
 from .monitor import Monitor
 from .task import TrainingTask
@@ -19,23 +20,64 @@ from .task import TrainingTask
 _logger = logging.getLogger(__name__)
 
 
-def param_groups_encoder_decoder(model, weight_decay: float, encoder_lr_scale: float = 1.0):
-    """ Param groups w/ no weight decay for norm, bias, embedding params, and optional encoder LR scaling. """
+def param_groups_lr_scaled(model, opt_cfg: OptimizationCfg, verbose: bool = False):
+    """ Param groups w/ per component LR scales, optional layer-wise LR decay, and no weight decay for norm, bias,
+    and model specified (no_weight_decay()) params.
+
+    Uses the model's param_layer_map() ({name: (component, layer id, num layers)}), params of models w/o one are
+    assigned by name prefix ('image_encoder.' -> encoder, else decoder) w/o layer decay.
+    """
     no_wd = set(model.no_weight_decay()) if hasattr(model, 'no_weight_decay') else set()
+    if hasattr(model, 'param_layer_map'):
+        layer_map = model.param_layer_map()
+    else:
+        layer_map = {
+            n: ('encoder' if n.startswith('image_encoder.') else 'decoder', 0, 1) for n, _ in model.named_parameters()}
+    component_scale = {
+        'encoder': opt_cfg.encoder_lr_scale,
+        'bridge': opt_cfg.bridge_lr_scale,
+        'decoder': opt_cfg.decoder_lr_scale,
+    }
+    component_decay = {'encoder': opt_cfg.encoder_layer_decay, 'decoder': opt_cfg.decoder_layer_decay}
+    overrides = [(re.compile(k), v) for k, v in (opt_cfg.lr_scale_overrides or {}).items()]
+
     groups = {}
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        is_encoder = name.startswith('image_encoder.')
-        decay = not (param.ndim <= 1 or name.endswith('.bias') or name in no_wd)
-        key = (is_encoder, decay)
+        component, layer_id, num_layers = layer_map[name]
+        scale = component_scale[component]
+        decay = component_decay.get(component)
+        if decay is not None:
+            scale *= decay ** (num_layers - 1 - layer_id)
+        for regex, s in overrides:
+            if regex.search(name):
+                scale *= s
+                break
+        use_wd = not (param.ndim <= 1 or name.endswith('.bias') or name in no_wd)
+        key = (component, round(scale, 12), use_wd)
         if key not in groups:
             groups[key] = {
                 'params': [],
-                'weight_decay': weight_decay if decay else 0.,
-                'lr_scale': encoder_lr_scale if is_encoder else 1.0,
+                'param_names': [],
+                'weight_decay': opt_cfg.weight_decay if use_wd else 0.,
+                'lr_scale': scale,
             }
         groups[key]['params'].append(param)
+        groups[key]['param_names'].append(name)
+
+    if verbose:
+        summary = {}
+        for (component, scale, _), g in groups.items():
+            s = summary.setdefault(component, {'num_params': 0, 'scales': set()})
+            s['num_params'] += sum(p.numel() for p in g['params'])
+            s['scales'].add(scale)
+        for component, s in summary.items():
+            _logger.info(
+                f'LR param groups [{component}]: {s["num_params"] / 1e6:.1f}M params, '
+                f'lr_scale {min(s["scales"]):.3g} - {max(s["scales"]):.3g} ({len(s["scales"])} distinct)')
+    for g in groups.values():
+        del g['param_names']
     return list(groups.values())
 
 
@@ -90,11 +132,7 @@ class Trainer:
             opt_kwargs['betas'] = tuple(opt_cfg.betas)
         if opt_cfg.momentum is not None:
             opt_kwargs['momentum'] = opt_cfg.momentum
-        if opt_cfg.layer_decay is not None:
-            params = self.model
-            opt_kwargs['layer_decay'] = opt_cfg.layer_decay
-        else:
-            params = param_groups_encoder_decoder(self.model, opt_cfg.weight_decay, opt_cfg.encoder_lr_scale)
+        params = param_groups_lr_scaled(self.model, opt_cfg, verbose=self.device_env.is_primary())
         self.optimizer = create_optimizer_v2(
             params,
             opt_cfg.optimizer,

@@ -290,3 +290,32 @@ def test_tiktoken_tokenizer():
     assert ids[0] == tok.convert_tokens_to_ids('<s_pretrain>') and ids[-1] == tok.eos_token_id
     assert tok.decode(ids, skip_special_tokens=True) == 'Total: $56.78'
     assert get_added_tokens(tok) == ['<s_pretrain>']
+
+
+@pytest.mark.parametrize('model_type', ['cruller', 'fritter', 'cronut'])
+def test_param_groups_lr_scaled(model_type):
+    from pixr.framework.config import OptimizationCfg
+    from pixr.framework.trainer import param_groups_lr_scaled
+    cfg = _tiny_cronut_cfg() if model_type == 'cronut' else _tiny_cfg(model_type)
+    model = create_model(cfg, vocab_size=100, pad_token_id=1)
+    layer_map = model.param_layer_map()
+    assert set(layer_map) == {n for n, _ in model.named_parameters()}
+    opt = OptimizationCfg(
+        encoder_lr_scale=0.1, encoder_layer_decay=0.5, bridge_lr_scale=1.0, decoder_lr_scale=0.5,
+        decoder_layer_decay=0.5, lr_scale_overrides={r'embed_tokens|text_embed': 4.0})
+    groups = param_groups_lr_scaled(model, opt)
+    assert sum(len(g['params']) for g in groups) == len(list(model.parameters()))
+    scale_of = {id(p): g['lr_scale'] for g in groups for p in g['params']}
+    params = dict(model.named_parameters())
+    for name, (component, layer_id, num_layers) in layer_map.items():
+        base = {'encoder': 0.1, 'bridge': 1.0, 'decoder': 0.5}[component]
+        if component != 'bridge':
+            base *= 0.5 ** (num_layers - 1 - layer_id)
+        if 'embed_tokens' in name or 'text_embed' in name:
+            base *= 4.0
+        assert abs(scale_of[id(params[name])] - base) < 1e-9, name
+    if model_type == 'cruller':
+        assert layer_map['text_decoder.layers.0.encoder_attn.q_proj.weight'][0] == 'bridge'
+        assert layer_map['text_decoder.embed_tokens.weight'][1] == layer_map['text_decoder.embed_tokens.weight'][2] - 1
+    if model_type == 'fritter':
+        assert layer_map['projector.fc1.weight'][0] == 'bridge'
