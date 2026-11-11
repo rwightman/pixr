@@ -5,45 +5,50 @@ build-backend = "pdm.backend"
 [project]
 name = "pixr"
 authors = [
-    {name = "Ross Wightman", email = "ross@huggingface.co"},
-    {name = "Pablo Montalvo-Leroux", email = "pablo@huggingface.co"},
+    {name = "Ross Wightman", email = "rwightman@gmail.com"},
 ]
-description = ""
+description = "Pixel Reading: OCR-free document understanding models (image encoder + text decoder), training and evaluation"
 readme = "README.md"
 requires-python = ">=3.10"
-keywords = ["document", "document-ai", "transformers", "ocr", "scale"]
-license = {text = "Apache-2.0"}
+keywords = ["document-ai", "ocr-free", "document-understanding", "vision-language", "docvqa", "pytorch"]
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 classifiers = [
-        'Development Status :: 4 - Beta',
-        'Intended Audience :: Education',
-        'Intended Audience :: Science/Research',
-        'License :: OSI Approved :: Apache Software License',
-        'Programming Language :: Python :: 3.7',
-        'Programming Language :: Python :: 3.8',
-        'Programming Language :: Python :: 3.9',
-        'Programming Language :: Python :: 3.10',
-        'Programming Language :: Python :: 3.11',
-        'Topic :: Scientific/Engineering',
-        'Topic :: Scientific/Engineering :: Artificial Intelligence',
-        'Topic :: Software Development',
-        'Topic :: Software Development :: Libraries',
-        'Topic :: Software Development :: Libraries :: Python Modules',
+    'Development Status :: 3 - Alpha',
+    'Intended Audience :: Education',
+    'Intended Audience :: Science/Research',
+    'Programming Language :: Python :: 3',
+    'Programming Language :: Python :: 3 :: Only',
+    'Topic :: Scientific/Engineering',
+    'Topic :: Scientific/Engineering :: Artificial Intelligence',
+    'Topic :: Scientific/Engineering :: Image Recognition',
+    'Topic :: Software Development :: Libraries :: Python Modules',
 ]
 dependencies = [
-    "torch",
+    "torch>=2.8",  # FSDP2 (fully_shard, set_reshard_after_forward), FlexAttention
     # NOTE NaFlexVit attn_backend and pretrained linear patch embed in_chans adaptation need the timm
     # naflex-attn-backends branch (based on, and still versioned as, 1.0.31), raise this pin once released
     "timm>=1.0.31",
     "transformers",  # tokenizers only
     "huggingface_hub",
     "safetensors",
-    "chugr",
+    "fsspec",
+    "numpy",
+    "chugr>=0.2.0.dev0",  # chugr 0.2 (revive) loaders, NaFlex batching
     "Levenshtein",
     "pyyaml",
     "jsonargparse",
     "tiktoken",
 ]
 dynamic = ["version"]
+
+[project.optional-dependencies]
+wandb = ["wandb"]
+tensorboard = ["tensorboard"]
+
+[project.scripts]
+pixr-train = "pixr.app.train:main"
+pixr-eval = "pixr.app.eval:main"
 
 [project.urls]
 homepage = "https://github.com/rwightman/pixr"

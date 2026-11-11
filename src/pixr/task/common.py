@@ -103,8 +103,9 @@ def trim_padding(text_input: torch.Tensor, text_target: torch.Tensor, pad_token_
 class ImageTextTask(TrainingTask):
     """ Base for image -> text tasks, agnostic to the model family (Cruller, Fritter, Cronut).
 
-    Models implement: forward(image_input, text_input) -> text logits, prefill() / step() for generation,
-    image_encoder.input_info (image preprocessing requirements), cfg, no_weight_decay(), set_grad_checkpointing().
+    Models implement: forward(image_input, text_input) -> text logits, the generation interface (encode_image() /
+    prefill() / step() w/ a reorderable DecodeState and max_text_length, see pixr.generation), image_encoder.input_info
+    (image preprocessing requirements), cfg, no_weight_decay(), set_grad_checkpointing().
     """
     task_tokens: Sequence[str] = ()
 
@@ -197,6 +198,8 @@ class ImageTextTask(TrainingTask):
             stop_token_ids=stop_token_ids,
             pad_token_id=self.pad_token_id,
             max_new_tokens=max_new_tokens,
+            # ids the output head covers but the tokenizer has no token for (tiktoken), never generated
+            bad_token_ids=getattr(self.tokenizer, 'unused_token_ids', None) or None,
         )
         image_input = move_to_device(drop_full_patch_valid(image_input), self.device)
         with self.autocast():

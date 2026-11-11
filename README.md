@@ -1,31 +1,46 @@
 # Pixel Reading (`pixr`)
 
-Continuation of the original `pixparse` project (huggingface/pixparse, 2023), renamed and revived. Data
-pipelines are provided by [`chugr`](https://github.com/rwightman/chugr) (formerly `chug`).
+OCR-free, end-to-end document understanding models trained on open data: pixels in, text out. `pixr` covers the
+models (image encoder + text decoder families), the training tasks (page reading pretraining, DocVQA fine-tuning),
+generation (KV cached greedy / beam search) and a lightweight PyTorch training framework (DDP / FSDP2, compile, EMA).
+Data pipelines are provided by [`chugr`](https://github.com/rwightman/chugr).
 
-## Introduction
+`pixr` is the continuation of the original `pixparse` project (huggingface/pixparse, 2023), renamed and revived.
 
-An open reproduction of OCR-free end-to-end document understanding models with open data.
+## Status
 
-Broadly focused on these model types:
-* image encoder + text decoder w/ pixels and text tokens as input (as per Donut)
-* image encoder + text decoder w/ only pixels as input (as per Pix2Struct)
-* image encoder + text encoder-decoder w/ pixels and text tokens as input (as per PaLI/PaLI-X)
+Alpha, expect breaking changes. The current focus is reproducing decent OCR / DocVQA results w/ open data and modern
+(NaFlex, native aspect ratio) image encoders.
 
-The training objectives and pretraining datasets will also be inspired by the associated papers above, but will mix and match. For example, we may train a Donut or PaLI-X style model with a Pix2Struct objective (masked document images w/ simplified HTML target text).
+### Changes since `pixparse`
 
-## Status (revive branch)
+* Ported to `chugr` 0.2, NaFlexVit (native aspect / variable resolution) image encoders, and self-contained text
+  decoders (BART, Ettin, Qwen3) w/ three model families (see below)
+* FSDP2, torch.compile, EMA, NaFlex batching, chunked LM loss, KV cached greedy / beam search generation
+* Fixes for issues that hampered the original DocVQA results:
+  * DocVQA fine-tune loss was applied to question + answer tokens (prompt masking used the task start token)
+  * train / eval image preprocessing mismatched (aspect preserving resize + pad vs stretch, long axis rotation)
+  * DocVQA eval decoded by re-tokenizing the generated string each step (BPE round trip is not idempotent)
+  * `scale_embedding` was forced on for BART decoders (copied from Donut's mBART, BART is trained w/o)
+  * `ModelArgs` command line overrides (image size, etc) were silently dropped
+  * pretrained BART cross-attention weights significantly slow learning w/ an image encoder, cross-attention is now
+    re-initialized w/ zero init output projections by default (decoder starts as the pretrained LM)
 
-The `revive` branch ports `pixr` to `chugr` 0.2, NaFlexVit (native aspect / variable resolution) image encoders,
-a self-contained text decoder, and fixes a number of issues that hampered the original DocVQA results:
+## Installation
 
-* DocVQA fine-tune loss was applied to question + answer tokens (prompt masking used the task start token)
-* train / eval image preprocessing mismatched (aspect preserving resize + pad vs stretch, long axis rotation)
-* DocVQA eval decoded by re-tokenizing the generated string each step (BPE round trip is not idempotent)
-* `scale_embedding` was forced on for BART decoders (copied from Donut's mBART, BART is trained w/o)
-* `ModelArgs` command line overrides (image size, etc) were silently dropped
-* pretrained BART cross-attention weights significantly slow learning w/ an image encoder, cross-attention is now
-  re-initialized w/ zero init output projections by default (decoder starts as the pretrained LM)
+```bash
+pip install --pre pixr   # pulls in chugr
+pip install --pre "pixr[wandb]"   # optional logging extras: wandb, tensorboard
+```
+
+NOTE the NaFlexVit attention backends (`attn_backend`) and pretrained patch embedding channel adaptation used by the
+NaFlex models need `timm` changes that are not in a release yet, until they are, install `timm` from source w/ them.
+
+From a source checkout (the training / eval scripts and the test launcher live in the repository):
+
+```bash
+pip install -e ./chugr -e ./pixr
+```
 
 ## Models
 
@@ -85,17 +100,29 @@ HF tokenizers by name (`facebook/bart-base`, `Qwen/Qwen3-0.6B`, ...) or tiktoken
 
 ## Usage
 
-Scripts in `scripts/` cover the main workflow, see each script for env var options.
+### Training / evaluation apps
+
+The apps are installed as `pixr-train` / `pixr-eval` (or `python -m pixr.app.train` / `python -m pixr.app.eval`).
+Distributed runs use `torchrun` (or `python -m torch.distributed.run`):
+
+```bash
+torchrun --nproc_per_node 2 -m pixr.app.train --task read --task.model.name cruller_naflex_siglip2_base \
+  --train-data.source "<idl-wds shards>" --train-data.num-samples 200000 --trainer.num-intervals 40 ...
+pixr-eval --task docvqa --checkpoint-path <checkpoint.pt> \
+  --eval-data.source pixparse/docvqa-single-page-questions --eval-data.split validation --eval-data.format hfds
+```
+
+Scripts in `scripts/` (source checkout) cover the main workflow w/ tuned defaults, see each script for env var options:
 
 ```bash
 # 1. pretrain (read all text on a page) on IDL, streamed from the HF hub
-NUM_GPUS=2 MODEL=cruller_naflex_clip_base ./scripts/pretrain_idl.sh
+NUM_GPUS=2 MODEL=cruller_naflex_siglip2_base ./scripts/pretrain_idl.sh
 
 # held out reading CER / WER
-CHECKPOINT=output/pretrain_cruller_naflex_clip_base_idl/checkpoints/checkpoint-latest.pt ./scripts/eval_ocr.sh
+CHECKPOINT=output/pretrain_cruller_naflex_siglip2_base_idl/checkpoints/checkpoint-latest.pt ./scripts/eval_ocr.sh
 
 # 2. fine-tune on DocVQA (ANLS on validation each eval interval)
-CHECKPOINT=output/pretrain_cruller_naflex_clip_base_idl/checkpoints/checkpoint-latest.pt ./scripts/finetune_docvqa.sh
+CHECKPOINT=output/pretrain_cruller_naflex_siglip2_base_idl/checkpoints/checkpoint-latest.pt ./scripts/finetune_docvqa.sh
 
 # 3. evaluate (validation ANLS, or SPLIT=test for an eval server submission file)
 CHECKPOINT=output/finetune_docvqa/checkpoints/checkpoint-latest.pt ./scripts/eval_docvqa.sh
@@ -118,41 +145,6 @@ The full resolved config is written to `<output_dir>/<experiment>/config.yaml` a
 
 ### Distributed / compile
 
-For short test / train / eval runs on two GPUs, use the scenario launcher from an environment with editable
-`pixr`, `chugr`, and the local `timm` installed:
-
-```bash
-python scripts/run_review.py --list
-python scripts/run_review.py all --validate                 # parse app args, no GPU jobs
-python scripts/run_review.py smoke --dry-run                # inspect commands
-python scripts/run_review.py smoke --devices 0,1
-python scripts/run_review.py fsdp_compile naflex_repeat prefix_flex
-python scripts/run_review.py data_ranks                     # check rank streams are distinct
-python scripts/run_review.py tests parity
-python scripts/run_review.py all
-```
-
-The launcher runs scenarios sequentially through `pixr.app.train`, `pixr.app.eval`, pytest and
-`scripts/check_distributed.py`. Scenarios cover DDP / FSDP2, gradient accumulation, compile, checkpointing, EMA,
-NaFlex batching, all three model families, attention backends, checkpoint resume and DocVQA fine-tuning.
-`data_ranks` checks actual resampled WDS sample identities across ranks, without loading a model or decoding PDFs.
-It fails if any two ranks receive an identical stream. App runs also fail if no updates or non-finite losses are logged.
-`parity` compares FP32 DDP / FSDP2 model and EMA parameters and fails above a relative L2 difference of `1e-5`;
-its resumed losses and generated outputs are also recorded for inspection.
-
-Defaults are short execution checks: random initialization, 64 global samples per interval, batch 2 per GPU,
-accumulation 2, 256 image patches and 128 text tokens. `--pretrained` enables hub weight initialization for the
-app runs; tokenizers and Qwen3 / Ettin configs can still require downloads without it. `pretrained_tests` downloads
-HF reference weights; `docvqa` uses the HF DocVQA dataset. `--samples`, `--batch-size`, `--accum`, `--patches`,
-`--text-length`, and `--workers` adjust the workload. These short random-weight runs do not measure convergence.
-
-The default data paths are sibling `../data/idl/idl-train-000{01..07}.tar` for training and shard `00000` for eval;
-override with `--train-source` / `--eval-source`. `naflex_repeat` needs at least `GPUs * workers` training shards.
-Logs, exact commands, resolved configs, checkpoints and `summary.json` go into a new `../runs/review-<timestamp>`
-directory (`--output` overrides it). Each command has a 20-minute timeout (`--timeout` in seconds). Failed scenarios
-are logged and the remaining scenarios continue; `--fail-fast` stops at the first failure. The launcher exits
-nonzero on failure and prints a `tail -f` command for the active log.
-
 Distributed runs (`torch.distributed.run`) use DDP by default, `--trainer.fsdp true` shards params, grads and
 optimizer state w/ FSDP2 (`fully_shard` per encoder block / decoder layer + root, models list their blocks in
 `fsdp_shard_modules()`). The handling follows the OpenCLIP `TrainingTask` (`prepare_distributed` / `prepare_fsdp` /
@@ -171,6 +163,24 @@ optimizer state w/ FSDP2 (`fully_shard` per encoder block / decoder layer + root
 
 `scripts/check_distributed.py` checks single / DDP / FSDP parity (loss trajectories, final params), grad
 checkpointing, accumulation, compile, EMA, resume and generation through the Trainer on synthetic batches.
+
+### Generation
+
+`pixr.generation` provides batched, KV cached greedy (`generate_greedy`) and beam search (`generate_beam`) decoding,
+`--task.eval-num-beams` selects beam search for eval. Cruller, Fritter and Cronut share one incremental decoding
+interface:
+
+```python
+memory = model.encode_image(image_input)                         # per image, computed once
+logits, state = model.prefill(memory, prompt_ids, prompt_mask)   # left padded prompts
+logits, state = model.step(token_ids, state)                     # one token per hypothesis
+state.reorder(parent_idx)                                        # select / duplicate hypotheses (beam search)
+```
+
+The per image memory and the per hypothesis sequence state are separate (`pixr/models/kv_cache.py`). Cruller's
+cross-attention K / V are projected once inside each decoder layer and shared by all hypotheses of an image (several
+prompts or beams per image, image-major order), only the self-attention caches are reordered. Under FSDP, generation
+must run inside `task.full_params()` (ranks then decode independently).
 
 ### LR scaling
 
@@ -242,16 +252,60 @@ With the Task concept, the data pipeline exists outside the task. The data pipel
 
 A task is a `TrainingTask` (an `nn.Module` wrapping the model) implementing `training_forward(batch) -> (outputs, losses)`,
 optional `train_metrics()`, and `evaluate(loader)`. The generic `Trainer` owns everything else (optimizer, schedule,
-AMP, accumulation, setup ordering for DDP / FSDP2 / compile, EMA, checkpointing state). Tasks are agnostic to the model family,
-Cruller, Fritter and Cronut share the same generation interface: `memory = model.encode_image(image_input)` (per image,
-computed once), `logits, state = model.prefill(memory, prompt_ids, prompt_mask)`, `logits, state = model.step(token_ids, state)`
-and `state.reorder(parent_idx)` to select / duplicate hypotheses (beam search). The per image memory and the per hypothesis
-sequence state are separate (`pixr/models/kv_cache.py`): Cruller's cross-attention K / V are projected once inside each
-decoder layer and shared by all hypotheses of an image (several prompts or beams per image, image-major order), only the
-self-attention caches are reordered. Under FSDP, generation must run inside `task.full_params()`.
+AMP, accumulation, setup ordering for DDP / FSDP2 / compile, EMA, checkpointing state). Tasks are agnostic to the model family.
 
 ### Interval
 
 You'll see the term 'interval' in the code, sometimes next to epoch. It's related, but an epoch means 'one complete pass of the dataset', an interval may be an epoch, but it may not. Interval is a span of training between checkpoints, ideally meaningful enough in duration to warrant evaluating and archiving each interval checkpoint.
 
-In OpenCLIP development the term arose when using shard sampling with replacement, were the intervals between checkpoints were determined by limitations on job durations or likelihood of crashes.
+In OpenCLIP development the term arose when using shard sampling with replacement, where the intervals between checkpoints were determined by limitations on job durations or likelihood of crashes.
+
+## Development
+
+Tests: `pytest tests` (`tests/test_distributed.py` runs FSDP2 / DDP on a single rank NCCL process group, skipped w/o CUDA).
+
+For short test / train / eval runs on two GPUs (source checkout), use the scenario launcher from an environment with editable
+`pixr`, `chugr`, and the local `timm` installed:
+
+```bash
+python scripts/run_review.py --list
+python scripts/run_review.py all --validate                 # parse app args, no GPU jobs
+python scripts/run_review.py smoke --dry-run                # inspect commands
+python scripts/run_review.py smoke --devices 0,1
+python scripts/run_review.py fsdp_compile naflex_repeat prefix_flex
+python scripts/run_review.py data_ranks                     # check rank streams are distinct
+python scripts/run_review.py tests parity
+python scripts/run_review.py all
+```
+
+The launcher runs scenarios sequentially through `pixr.app.train`, `pixr.app.eval`, pytest and
+`scripts/check_distributed.py`. Scenarios cover DDP / FSDP2, gradient accumulation, compile, checkpointing, EMA,
+NaFlex batching, all three model families, attention backends, checkpoint resume and DocVQA fine-tuning.
+`data_ranks` checks actual resampled WDS sample identities across ranks, without loading a model or decoding PDFs.
+It fails if any two ranks receive an identical stream. App runs also fail if no updates or non-finite losses are logged.
+`parity` compares FP32 DDP / FSDP2 model and EMA parameters and fails above a relative L2 difference of `1e-5`;
+its resumed losses and generated outputs are also recorded for inspection.
+
+Defaults are short execution checks: random initialization, 64 global samples per interval, batch 2 per GPU,
+accumulation 2, 256 image patches and 128 text tokens. `--pretrained` enables hub weight initialization for the
+app runs; tokenizers and Qwen3 / Ettin configs can still require downloads without it. `pretrained_tests` downloads
+HF reference weights; `docvqa` uses the HF DocVQA dataset. `--samples`, `--batch-size`, `--accum`, `--patches`,
+`--text-length`, and `--workers` adjust the workload. These short random-weight runs do not measure convergence.
+
+The default data paths are sibling `../data/idl/idl-train-000{01..07}.tar` for training and shard `00000` for eval;
+override with `--train-source` / `--eval-source`. `naflex_repeat` needs at least `GPUs * workers` training shards.
+Logs, exact commands, resolved configs, checkpoints and `summary.json` go into a new `../runs/review-<timestamp>`
+directory (`--output` overrides it). Each command has a 20-minute timeout (`--timeout` in seconds). Failed scenarios
+are logged and the remaining scenarios continue; `--fail-fast` stops at the first failure. The launcher exits
+nonzero on failure and prints a `tail -f` command for the active log.
+
+## Acknowledgements
+
+Model and training design draws on [Donut](https://github.com/clovaai/donut), Pix2Struct, PaLI, LLaVA and GenLIP.
+Image encoders come from [`timm`](https://github.com/huggingface/pytorch-image-models), the training task / FSDP2
+handling and NaFlex batching follow [OpenCLIP](https://github.com/mlfoundations/open_clip), datasets are on the
+Hugging Face Hub under the [`pixparse`](https://huggingface.co/pixparse) organization.
+
+## License
+
+Apache 2.0, see [LICENSE](LICENSE).

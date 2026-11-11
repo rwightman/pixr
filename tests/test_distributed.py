@@ -146,3 +146,21 @@ def test_fsdp_mixed_precision_generation_cache(process_group, model_name):
         assert task.generate(batch['image_input'], start, [], 6) == out
     assert not task.has_full_params(model)
     assert all(hasattr(p, 'full_tensor') for p in model.parameters())  # resharded by the outermost exit
+
+
+def test_read_eval_reference_capped_at_model_text_length():
+    """ References are capped at what generation can produce: the model text length, not only the eval budget. """
+    from pixr.framework import DeviceEnv
+    from pixr.models import ModelArgs
+    from pixr.task import get_task, get_task_cfgs
+    cfg = replace(
+        get_task_cfgs()['read'](),
+        model=ModelArgs(name='cruller_naflex_siglip2_base', pretrained=False, text_max_length=32), amp=False)
+    task = get_task('read')(cfg, device_env=DeviceEnv())
+    assert cfg.eval_max_new_tokens > 32 and task.get_trainable_module().max_text_length == 32
+    text = ' '.join(f'word{i}' for i in range(200))
+    ref, truncated = task._prepare_reference(text)
+    assert truncated
+    assert len(task.tokenizer(ref, add_special_tokens=False).input_ids) <= 31  # 32 minus the task start prompt
+    short, truncated = task._prepare_reference('a few words')
+    assert not truncated and short.strip() == 'a few words'

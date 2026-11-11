@@ -7,6 +7,10 @@ Two lifetimes are kept apart:
 * Sequence state, per hypothesis: `DecodeState` w/ the per-layer self-attention `LayerKVCache`, grows every step and
   is reordered (`DecodeState.reorder`) when hypotheses are selected / duplicated (beam search).
 
+NOTE prefix-LM models (Fritter, Cronut) keep the image prefix K / V in the self-attention cache, so it is part of the
+sequence state and copied for every hypothesis (beams x prefix length x layers) and on every reorder. Sharing it per
+image as Cruller's cross-attention memory would need the prefix and text K / V attended separately (two segments).
+
 All of these are plain classes (not dataclasses, dicts or lists) on purpose. FSDP2 mixed-precision input casting
 rebuilds dataclasses / dicts / lists / tuples passed into a wrapped module's forward, updates made to them inside a
 layer would be made to a copy and lost. Plain objects pass through by identity. Their tensors are therefore not cast

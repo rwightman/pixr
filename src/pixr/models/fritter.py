@@ -88,6 +88,10 @@ class Fritter(nn.Module):
         self.text_decoder = create_text_decoder(dec_cfg, vocab_size=vocab_size, pad_token_id=pad_token_id)
         self.image_encoder = ImageEncoderTimm(replace(cfg.image_encoder, head_type=None, out_dim=None))
         self.token_merge = cfg.prefix_token_merge
+        if self.token_merge > 1 and getattr(self.image_encoder.trunk, 'patch_drop', None) is not None:
+            # merging needs the complete patch grid (and its coords), patch dropout removes tokens
+            raise ValueError(
+                'prefix_token_merge > 1 is not supported w/ image encoder patch dropout (patch_drop_rate > 0).')
         merge_dim = self.image_encoder.out_dim * self.token_merge ** 2
         self.projector = Projector(merge_dim, self.text_decoder.dim, cfg.projector_type)
         self.cfg = replace(cfg, image_encoder=self.image_encoder.cfg, text_decoder=self.text_decoder.cfg)

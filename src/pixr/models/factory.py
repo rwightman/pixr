@@ -8,6 +8,7 @@ from .config import ModelCfg, get_model_config
 from .cruller import Cruller
 from .cronut import Cronut
 from .fritter import Fritter
+from .text_decoder import resize_pos_embed
 
 _logger = logging.getLogger(__name__)
 
@@ -52,7 +53,8 @@ def create_model(
 
 @torch.no_grad()
 def load_model_state(model: torch.nn.Module, state_dict, strict: bool = True):
-    """ Load model weights, adapting token embedding rows if the vocab grew. """
+    """ Load model weights, adapting token embedding rows if the vocab grew and learned position embeddings if the
+    text length changed. """
     state_dict = dict(clean_state_dict(state_dict))
     own = model.state_dict()
     vocab_keys = getattr(model, 'vocab_param_names', ('text_decoder.embed_tokens.weight', 'text_decoder.output_bias'))
@@ -66,6 +68,11 @@ def load_model_state(model: torch.nn.Module, state_dict, strict: bool = True):
             dst[src.shape[0]:] = src.mean(0, keepdim=True)
             state_dict[key] = dst
             _logger.info(f'Expanded {key} {src.shape[0]} -> {dst.shape[0]}.')
+    for key, src in list(state_dict.items()):
+        # learned (BART) position embeddings, the text length was changed from the checkpoint's
+        if key.endswith('embed_positions.weight') and key in own and src.shape != own[key].shape:
+            state_dict[key] = resize_pos_embed(src, own[key].shape[0])
+            _logger.info(f'Resized {key} {src.shape[0]} -> {own[key].shape[0]}.')
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if strict and (missing or unexpected):
         raise RuntimeError(f'Error loading model state. Missing: {missing}, unexpected: {unexpected}')

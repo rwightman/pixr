@@ -27,6 +27,16 @@ class TiktokenTokenizer:
         for t in (self.eos_token, self.pad_token, self.bos_token):
             self._special[t] = self.vocab_size + len(self._special)
         self._id_to_special = {v: k for k, v in self._special.items()}
+        # ids below n_vocab that never occur in encoded text, a model can still output them:
+        # * ids w/o a token (cl100k_base has 16), decoding one raises
+        # * the encoding's own special tokens (<|endoftext|>, ...), text is encoded w/ encode_ordinary (pixr control
+        #   tokens are above the base vocab), decoding one would produce its literal string
+        self._unused_ids = {self.enc.encode_single_token(t) for t in self.enc.special_tokens_set}
+        for i in range(self.vocab_size):
+            try:
+                self.enc.decode_single_token_bytes(i)
+            except KeyError:
+                self._unused_ids.add(i)
         self._split_re = None
         self._update_split()
 
@@ -59,6 +69,12 @@ class TiktokenTokenizer:
         if added:
             self._update_split()
         return added
+
+    @property
+    def unused_token_ids(self) -> List[int]:
+        """ Base vocab ids that never occur in encoded text (no token, or the encoding's own special tokens), to be
+        suppressed in generation (ignored by decode). """
+        return sorted(self._unused_ids)
 
     @property
     def all_special_ids(self) -> List[int]:
@@ -120,7 +136,8 @@ class TiktokenTokenizer:
         out, run = [], []
         for i in ids:
             if i < self.vocab_size:
-                run.append(i)
+                if i not in self._unused_ids:  # no token (enc.decode would raise) or a base special token
+                    run.append(i)
                 continue
             if run:
                 out.append(self.enc.decode(run))

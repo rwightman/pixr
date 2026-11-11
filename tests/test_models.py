@@ -674,3 +674,52 @@ def test_one_beam_matches_greedy_on_stop_token_ties():
     model2 = _MarkovModel(probs2.log())
     kw2 = {**kw, 'stop_token_ids': [2]}
     assert generate_beam(model2, None, num_beams=1, **kw2) == generate_greedy(model2, None, **kw2) == [[2]]
+
+
+def test_tiktoken_unused_ids_never_generated_or_decoded():
+    from pixr.tokenizers import TokenizerCfg, create_tokenizer
+    tok = create_tokenizer(TokenizerCfg(name='tiktoken:cl100k_base'))
+    unused = tok.unused_token_ids
+    # 16 ids w/o a token + the 5 cl100k_base special tokens (<|endoftext|>, fim prefix / middle / suffix, <|endofprompt|>)
+    assert len(unused) == 21 and {100256, 100257, 100276} <= set(unused) and all(i < tok.vocab_size for i in unused)
+    hello = tok.encode('hello world')
+    assert tok.decode(hello[:1] + [100256] + hello[1:]) == 'hello world'  # ignored, no KeyError
+    assert tok.decode(hello[:1] + [100257] + hello[1:]) == 'hello world'  # not decoded as '<|endoftext|>'
+    assert tok.encode('a <|endoftext|> b') == tok.enc.encode_ordinary('a <|endoftext|> b')  # text, not the special
+    # generation suppresses them even when they would win the argmax
+    V, PROMPT, EOS = 8, 7, 2
+    probs = torch.full((V, V), 1e-9)
+    probs[PROMPT, 5], probs[PROMPT, 4] = 0.9, 0.1
+    probs[4, EOS] = probs[5, EOS] = 1.
+    model = _MarkovModel(probs.log())
+    kw = dict(prompt_ids=[[PROMPT]], stop_token_ids=[EOS], pad_token_id=1, max_new_tokens=4)
+    from pixr.generation import generate_beam
+    assert generate_greedy(model, None, **kw) == [[5, EOS]]
+    assert generate_greedy(model, None, bad_token_ids=[5], **kw) == [[4, EOS]]
+    assert generate_beam(model, None, num_beams=2, bad_token_ids=[5], **kw) == [[4, EOS]]
+
+
+def test_checkpoint_text_length_change(tmp_path):
+    """ A pixr checkpoint loads into a model w/ a different (BART, learned position) text length. """
+    from pixr.models import load_model_state
+    torch.manual_seed(0)
+    cfg = _tiny_cfg()
+    model = create_model(cfg, vocab_size=100, pad_token_id=1)
+    state = model.state_dict()
+    for max_length in (128, 32):
+        resized = create_model(replace(cfg, text_decoder=replace(cfg.text_decoder, max_length=max_length)),
+                               vocab_size=100, pad_token_id=1)
+        load_model_state(resized, state)
+        assert resized.text_decoder.embed_positions.weight.shape[0] == max_length + 2
+        assert torch.equal(resized.text_decoder.embed_tokens.weight, state['text_decoder.embed_tokens.weight'])
+
+
+def test_fritter_token_merge_rejects_patch_dropout():
+    cfg = _tiny_cfg('fritter')
+    kwargs = dict(cfg.image_encoder.model_kwargs, patch_drop_rate=0.5)
+    with pytest.raises(ValueError, match='patch dropout'):
+        create_model(replace(cfg, image_encoder=replace(cfg.image_encoder, model_kwargs=kwargs)),
+                     vocab_size=100, pad_token_id=1)
+    # w/o merging, patch dropout is fine
+    create_model(replace(cfg, prefix_token_merge=1, image_encoder=replace(cfg.image_encoder, model_kwargs=kwargs)),
+                 vocab_size=100, pad_token_id=1)

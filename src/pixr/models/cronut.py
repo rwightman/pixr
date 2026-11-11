@@ -5,12 +5,13 @@ bidirectionally among themselves, text attends causally to text and to all image
 text. Follows the open_clip NaFlex GenLIP modelling:
 
 * NaFlex linear patch embedding (no absolute position embedding), optional input / post-projection norms
-* interleaved 3-axis MRoPE: image patches at (t=0, y, x), text at a running 1D index after the image extent
+* 3-axis MRoPE (interleaved as Qwen3-VL, or sectioned as Qwen2-VL): image patches at (t=0, y, x), text at a running
+  1D index after the image extent
 * gated attention (sigmoid output gate fused into q_proj), optional qk-norm, SwiGLU FFN, LayerScale, DropPath
 * untied LM head, text embedding dim decoupled from trunk width via in / out projections
 
 Attention backends: 'sdpa' (dense prefix-LM bool mask) or 'flex' (FlexAttention prefix-LM block mask).
-Same training forward and prefill() / step() generation interface as Cruller and Fritter.
+Same training forward and encode_image() / prefill() / step() generation interface as Cruller and Fritter.
 """
 import logging
 from dataclasses import replace

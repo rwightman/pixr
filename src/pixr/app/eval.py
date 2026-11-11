@@ -37,7 +37,7 @@ class EvalCfg(Serializable):
     seed: int = 42
 
 
-def main(argv=None):
+def _run(argv=None):
     eval_cfg: EvalCfg = parse_cfg(
         EvalCfg,
         argv=argv,
@@ -83,7 +83,13 @@ def main(argv=None):
         _logger.info(f'Results written to {output_dir}')
 
 
-if __name__ == '__main__':
-    code = main()
+def main(argv=None):
+    """ Entry point for both launch forms (`pixr-eval` console script, `python -m pixr.app.eval`). """
+    code = _run(argv)
+    # NOTE only after a normal return, w/ an exception other ranks may still be in collectives, the launcher tears down
     destroy_distributed()
-    sys.exit(code)
+    return code
+
+
+if __name__ == '__main__':
+    sys.exit(main())

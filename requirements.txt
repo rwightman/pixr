@@ -1,11 +1,12 @@
-torch
-timm>=1.0.20
+torch>=2.8
+timm>=1.0.31
 transformers
 huggingface_hub
 safetensors
-chugr
+fsspec
+numpy
+chugr>=0.2.0.dev0
 Levenshtein
 pyyaml
-fsspec
 jsonargparse
 tiktoken

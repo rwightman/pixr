@@ -104,6 +104,9 @@ def cross_attention(
             meta.max_seqlen,
         )
         return out.reshape(B, T, H, D).transpose(1, 2)
+    # NOTE single token decode steps take sdpa, but w/ several hypotheses per image (beams) folded into the query
+    # length a step has q_len == group size and takes flex (a block mask per q_len), sdpa may be faster for so few
+    # queries, not benchmarked
     if mask.backend == 'flex' and q.shape[2] > 1 and dropout_p == 0.:
         return _get_compiled_flex()(q, k, v, block_mask=mask.flex_mask(q.shape[2]))
     return F.scaled_dot_product_attention(q, k, v, attn_mask=mask.sdpa_mask(), dropout_p=dropout_p)

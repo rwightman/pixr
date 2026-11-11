@@ -102,11 +102,13 @@ class ReadTask(ImageTextTask):
 
         * Every reference takes the same tokenizer round trip as the predictions (decoded token ids), so both
           sides share its text normalization (whitespace, characters the tokenizer can't represent).
-        * Capped at the eval generation budget (eval_max_new_tokens). Pages w/ longer transcriptions can't be
-          fully predicted, w/o the cap their CER is inflated by the unreachable tail.
+        * Capped at the tokens generation can actually produce: the eval budget (eval_max_new_tokens) and the
+          model's text length minus the prompt, as generation clamps to both. Pages w/ longer transcriptions
+          can't be fully predicted, w/o the cap their CER is inflated by the unreachable tail.
         """
         ids = self.tokenizer(text, add_special_tokens=False).input_ids
-        max_tokens = self.cfg.eval_max_new_tokens
+        prompt_len = len(self._prompts(1)[0])
+        max_tokens = min(self.cfg.eval_max_new_tokens, self.get_trainable_module().max_text_length - prompt_len)
         return self.tokenizer.decode(ids[:max_tokens], skip_special_tokens=True), len(ids) > max_tokens
 
     def evaluate(self, loader, use_ema: bool = False) -> Dict[str, Any]:

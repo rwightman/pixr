@@ -69,7 +69,7 @@ def _save_checkpoint(state: Dict[str, Any], checkpoint_dir: str, interval: int, 
     return path
 
 
-def main(argv=None):
+def _run(argv=None):
     train_cfg: TrainCfg = parse_cfg(
         TrainCfg,
         argv=argv,
@@ -180,7 +180,13 @@ def main(argv=None):
             del state
 
 
-if __name__ == '__main__':
-    code = main()
+def main(argv=None):
+    """ Entry point for both launch forms (`pixr-train` console script, `python -m pixr.app.train`). """
+    code = _run(argv)
+    # NOTE only after a normal return, w/ an exception other ranks may still be in collectives, the launcher tears down
     destroy_distributed()
-    sys.exit(code)
+    return code
+
+
+if __name__ == '__main__':
+    sys.exit(main())
