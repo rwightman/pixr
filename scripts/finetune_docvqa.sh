@@ -38,5 +38,4 @@ python -m torch.distributed.run --nproc_per_node "${NUM_GPUS}" -m pixr.app.train
   --eval-frequency 2 \
   --experiment "${EXPERIMENT}" \
   --resume latest \
-  --tensorboard true \
   "$@"

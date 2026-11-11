@@ -44,6 +44,7 @@ class TrainCfg(Serializable):
     eval_ema: bool = False  # evaluate the EMA weights (if trainer.ema_decay set)
     checkpoint_frequency: int = 1  # save checkpoint every N intervals (last interval always saved)
     checkpoint_keep: int = 3  # number of most recent interval checkpoints to keep (0 == keep all)
+    stop_interval: Optional[int] = None  # exit after this interval (eval + checkpoint), resume w/ changed cfg for staged runs
     seed: int = 42
 
     wandb: bool = False
@@ -162,7 +163,8 @@ def _run(argv=None):
         train_loader.set_interval(interval)
         results = {'train': trainer.train_interval(train_loader)}
 
-        last = interval + 1 == train_cfg.trainer.num_intervals
+        stop = train_cfg.stop_interval is not None and interval >= train_cfg.stop_interval
+        last = interval + 1 == train_cfg.trainer.num_intervals or stop
         if eval_loader is not None and ((interval + 1) % train_cfg.eval_frequency == 0 or last):
             # w/ FSDP, params are gathered for eval so each rank decodes its eval shard independently
             with task.full_params(use_ema=train_cfg.eval_ema):
@@ -178,6 +180,9 @@ def _run(argv=None):
                 path = _save_checkpoint(state, checkpoint_dir, interval, train_cfg.checkpoint_keep)
                 _logger.info(f'Saved checkpoint {path}')
             del state
+        if stop:
+            _logger.info(f'Stopping after interval {interval} (stop_interval).')
+            break
 
 
 def main(argv=None):
