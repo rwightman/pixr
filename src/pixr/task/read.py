@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Tuple
 
 import chugr
-from chugr.doc import SynthTextCfg
+from chugr.doc import PatchLabelCfg, SynthTextCfg
 
 from pixr.framework import DeviceEnv, TaskCfg
 from pixr.utils import text_error_rates
@@ -29,6 +29,9 @@ class ReadTaskCfg(TaskCfg):
     synth_prob: float = 0.  # train, probability of a synthetic rendering replacing the page
     eval_synth_prob: float = 0.  # eval, 1.0 for held-out synthetic reading CER
     synth: SynthTextCfg = field(default_factory=SynthTextCfg)
+    # patch level text labels for the patch loss (patch_loss_weight > 0), from per token line poly / bbox regions
+    patch_labels: int = 512  # labels per page (text patches + up to patch_blank_frac blank patches)
+    patch_blank_frac: float = 0.2
 
 
 class ReadTask(ImageTextTask):
@@ -47,6 +50,10 @@ class ReadTask(ImageTextTask):
         self.results = []
 
     def train_data_cfg(self):
+        patch_label_cfg = None
+        if self.cfg.patch_loss_weight > 0:
+            assert self.input_info.get('patch_size'), 'the patch loss requires a patch (NaFlex) image input'
+            patch_label_cfg = PatchLabelCfg(num_labels=self.cfg.patch_labels, blank_frac=self.cfg.patch_blank_frac)
         return chugr.DataTaskDocReadCfg(
             image_process_fn=self.image_preprocess_train,
             image_process_factory=self.image_preprocess_factory,
@@ -56,6 +63,9 @@ class ReadTask(ImageTextTask):
             render_dpi=self.cfg.render_dpi,
             synth_prob=self.cfg.synth_prob,
             synth_cfg=self.cfg.synth,
+            patch_label_cfg=patch_label_cfg,
+            patch_size=self.input_info.get('patch_size'),
+            tokenizer=self.tokenizer,
             error_handler='log_and_continue',
         )
 

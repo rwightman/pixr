@@ -22,6 +22,9 @@ class TaskCfg:
     # distinct text lengths (compile / FlexAttention mask shapes) for a few extra pad tokens, 1 disables rounding
     text_pad_multiple: int = 64
     loss_chunk_size: int = 4096  # fused (chunked) LM head + CE, tokens per chunk, 0 to materialize full logits
+    # patch level text loss: image patch features -> token at that patch (or blank) through the shared LM head,
+    # for batches w/ 'patch_label_index' / 'patch_label' (data dependent, e.g. the read task), models w/ patch_index
+    patch_loss_weight: float = 0.
 
 
 @dataclass

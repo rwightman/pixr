@@ -141,8 +141,15 @@ class ImageTextTask(TrainingTask):
         target = text_target[:, 1:]
         z_loss = self.cfg.z_loss_weight > 0
         outputs = {}
+        patch_index = batch.get('patch_label_index') if self.cfg.patch_loss_weight > 0 else None
+        if patch_index is not None:
+            assert self.cfg.loss_chunk_size > 0, 'patch level loss requires the fused LM head + CE (loss_chunk_size > 0)'
         if self.cfg.loss_chunk_size > 0:
-            hidden = model(batch['image_input'], text_input[:, :-1], return_hidden=True)
+            if patch_index is not None:
+                hidden, patch_hidden = model(
+                    batch['image_input'], text_input[:, :-1], return_hidden=True, patch_index=patch_index)
+            else:
+                hidden = model(batch['image_input'], text_input[:, :-1], return_hidden=True)
             # outside the model forward, w/ FSDP2 the root's params (incl. the LM head / tied embedding) stay
             # unsharded after forward until backward
             weight, bias = self.get_trainable_module().lm_head_params()
@@ -164,6 +171,18 @@ class ImageTextTask(TrainingTask):
             losses['loss'] = ce + self.cfg.z_loss_weight * z
             losses['ce_loss'] = ce
             losses['z_loss'] = z
+        if patch_index is not None:
+            # NOTE pages w/o labels (all ignore) contribute nothing, mean over the labeled patches of the batch
+            patch_ce, _ = fused_linear_cross_entropy(
+                patch_hidden.flatten(0, 1),
+                weight,
+                batch['patch_label'].flatten(),
+                bias=bias,
+                chunk_size=self.cfg.loss_chunk_size,
+            )
+            losses['ce_loss'] = ce
+            losses['patch_loss'] = patch_ce
+            losses['loss'] = losses['loss'] + self.cfg.patch_loss_weight * patch_ce
         return outputs, losses
 
     def training_forward(self, batch: Dict[str, Any]):

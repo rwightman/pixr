@@ -338,8 +338,12 @@ class Cronut(nn.Module):
         img_pos, text_start = self._image_positions(image_input)
         return PrefixMemory(img, _patch_valid(image_input), pos=img_pos, text_start=text_start)
 
-    def _prefix_forward(self, memory: PrefixMemory, text_ids, text_mask, cache=None, return_hidden=False):
-        """ Run [image ; text] through the trunk, returns text position logits and the final text positions. """
+    def _prefix_forward(self, memory: PrefixMemory, text_ids, text_mask, cache=None, return_hidden=False,
+                        patch_index=None):
+        """ Run [image ; text] through the trunk, returns text position logits and the final text positions.
+
+        W/ patch_index [B, K], also returns the (pre-head) final features of those image patches.
+        """
         img, patch_valid, img_pos, text_start = memory.embeds, memory.mask, memory.pos, memory.text_start
         txt = self.embed_text(text_ids)
         x = torch.cat([img, txt.to(img.dtype)], dim=1)
@@ -349,20 +353,31 @@ class Cronut(nn.Module):
         cos, sin = self.rotary(pos)
         key_valid = torch.cat([patch_valid, text_mask.bool()], dim=1)
         x = self._run(x, cos, sin, self._attn_mask(key_valid, P, x), cache=cache)
+        patch_x = None
+        if patch_index is not None:
+            patch_x = self.out_proj(x[:, :P].gather(1, patch_index[..., None].expand(-1, -1, x.shape[-1])))
         x = x[:, P:]
         x = self.out_proj(x) if return_hidden else self._logits(x)
-        return x, key_valid, txt_pos[:, -1]
+        return x, key_valid, txt_pos[:, -1], patch_x
 
     def forward(
             self,
             image_input: Dict[str, torch.Tensor],
             text_input: torch.Tensor,
             return_hidden: bool = False,
-    ) -> torch.Tensor:
-        """ Teacher forced forward, returns text logits [B, T, V] (or pre-head features w/ return_hidden). """
+            patch_index: Optional[torch.Tensor] = None,
+    ):
+        """ Teacher forced forward, returns text logits [B, T, V] (or pre-head features w/ return_hidden).
+
+        W/ patch_index [B, K] (indices into the image patch sequence), returns (text output, patch features [B, K, E])
+        for patch level losses through the shared LM head (lm_head_params()).
+        """
         text_mask = torch.ones_like(text_input, dtype=torch.bool)  # right padded text, causal attention
         memory = self._encode_image(image_input)
-        out, _, _ = self._prefix_forward(memory, text_input, text_mask, return_hidden=return_hidden)
+        out, _, _, patch_x = self._prefix_forward(
+            memory, text_input, text_mask, return_hidden=return_hidden, patch_index=patch_index)
+        if patch_index is not None:
+            return out, patch_x
         return out
 
     def prefill(self, memory: PrefixMemory, prompt_ids: torch.Tensor, prompt_mask: torch.Tensor):
@@ -373,7 +388,7 @@ class Cronut(nn.Module):
         assert prompt_ids.shape[0] == memory.embeds.shape[0], \
             'one prompt per image, expand the state for more hypotheses'
         cache = [LayerKVCache() for _ in self.layers]
-        logits, key_valid, last_pos = self._prefix_forward(memory, prompt_ids, prompt_mask, cache=cache)
+        logits, key_valid, last_pos, _ = self._prefix_forward(memory, prompt_ids, prompt_mask, cache=cache)
         state = DecodeState(
             cache=cache, attn_mask=key_valid, pos=last_pos, memory=memory, prefix_len=memory.embeds.shape[1])
         return logits[:, -1], state
