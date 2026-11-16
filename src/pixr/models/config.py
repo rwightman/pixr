@@ -1,5 +1,6 @@
 import copy
 import logging
+import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -111,6 +112,7 @@ class CronutCfg(Serializable):
     attention_bias: bool = False
     mlp_bias: bool = False
     patch_input_norm: bool = False  # LayerNorm on raw flattened patches before projection
+    patch_input_norm_eps: float = 1e-1  # (pixel units) larger values limit the gain on near uniform patches (1e-1 per the norm ablation)
     patch_pre_norm: bool = True  # norm on projected patch embeddings (stream scale equalization)
     text_pre_norm: bool = True  # norm on projected text embeddings
     attn_backend: str = 'sdpa'  # 'sdpa' (dense prefix-LM mask) or 'flex' (prefix-LM block mask)
@@ -234,6 +236,9 @@ def list_models():
 
 
 def get_model_config(model_name):
+    """ Registered model config by name, or a model config .json file path. """
+    if model_name.endswith('.json') and os.path.isfile(model_name):
+        return ModelCfg.load(model_name)
     model_name = clean_name(model_name)
     cfg = _MODEL_CONFIGS.get(model_name, None)
     return copy.deepcopy(cfg)

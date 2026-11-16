@@ -191,7 +191,7 @@ class CronutPatchEmbed(nn.Module):
         super().__init__()
         in_chans = 1 if enc_cfg.image_fmt == 'L' else 3
         patch_dim = cfg.patch_size * cfg.patch_size * in_chans
-        self.norm_input = nn.LayerNorm(patch_dim) if cfg.patch_input_norm else nn.Identity()
+        self.norm_input = nn.LayerNorm(patch_dim, eps=cfg.patch_input_norm_eps) if cfg.patch_input_norm else nn.Identity()
         self.proj = nn.Linear(patch_dim, cfg.width, bias=True)
         self.norm_pre = norm_layer(cfg.width) if cfg.patch_pre_norm else nn.Identity()
         mean = tuple(enc_cfg.image_mean or (0.5,) * in_chans)
