@@ -9,9 +9,69 @@ and expose `max_text_length` (max decoder sequence length incl. prompt).
 
 Prompts are left padded (w/ `prompt_mask`) so all samples decode in lockstep.
 """
-from typing import Dict, List, Optional, Sequence, Union
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
+
+
+@dataclass
+class RepeatStopCfg:
+    """ Decode time repetition loop stop (greedy early stop + trim of the generated token ids).
+
+    A sequence that ends in >= `min_repeats` consecutive copies of a unit of <= `max_period` tokens, spanning
+    >= `min_span` tokens, is in a loop: greedy decoding stops it (checked every `check_every` steps) and
+    `trim_repeat_loop()` cuts it back to `keep` copies of the unit. Only sequences that didn't end w/ a stop token
+    are trimmed, a run the model ended itself is left as is.
+
+    Same purpose as Nougat's repetition detection (variance of the max logit over a sliding window), but on the
+    token ids: deterministic, model agnostic and also usable post-hoc (beam search, saved token ids). NOTE genuine
+    runs that long (rules, dot leaders, identical table rows) are cut as well.
+    """
+    min_repeats: int = 0  # copies of the unit to call it a loop, 0 disables
+    min_span: int = 32  # min tokens spanned by the repeats (short units need more copies)
+    max_period: int = 64  # max unit length in tokens
+    keep: int = 1  # copies of the unit kept when trimming
+    check_every: int = 8  # greedy, steps between loop checks (bounds the overshoot before stopping)
+
+    @property
+    def enabled(self) -> bool:
+        return self.min_repeats > 0
+
+    def span(self, period: int) -> int:
+        return max(period * self.min_repeats, self.min_span)
+
+
+def _loop_period(tokens: torch.Tensor, length: int, cfg: RepeatStopCfg) -> torch.Tensor:
+    """ [B] smallest unit period of a loop ending at `length` in tokens [B, >= length], 0 for no loop. """
+    period = torch.zeros(tokens.shape[0], dtype=torch.long, device=tokens.device)
+    for p in range(cfg.max_period, 0, -1):  # descending, the smallest periodic unit wins
+        span = cfg.span(p)
+        if span > length:
+            continue
+        x = tokens[:, length - span:length]
+        period = torch.where((x[:, p:] == x[:, :-p]).all(-1), p, period)
+    return period
+
+
+def trim_repeat_loop(tokens: Sequence[int], cfg: RepeatStopCfg, stop_token_ids: Sequence[int] = ()) -> Tuple[List[int], bool]:
+    """ Cut a generated sequence ending in a repetition loop back to `cfg.keep` copies of the looped unit.
+
+    Returns (tokens, trimmed). Sequences ending w/ a stop token are returned unchanged.
+    """
+    tokens = list(tokens)
+    if not cfg.enabled or not tokens or tokens[-1] in set(stop_token_ids):
+        return tokens, False
+    n = len(tokens)
+    for p in range(1, cfg.max_period + 1):
+        span = cfg.span(p)
+        if span > n or tokens[n - span + p:] != tokens[n - span:n - p]:
+            continue
+        start = n - span
+        while start > 0 and tokens[start - 1] == tokens[start - 1 + p]:
+            start -= 1  # the loop's first copy
+        return tokens[:start + cfg.keep * p], True
+    return tokens, False
 
 
 def left_pad_prompts(prompt_ids: Sequence[Sequence[int]], pad_token_id: int, device):
@@ -34,6 +94,7 @@ def generate_greedy(
         pad_token_id: int,
         max_new_tokens: int = 128,
         bad_token_ids: Optional[Sequence[int]] = None,
+        repeat_stop: Optional[RepeatStopCfg] = None,
 ) -> List[List[int]]:
     """ Greedy decode a batch of (variable length) prompts conditioned on images.
 
@@ -45,6 +106,7 @@ def generate_greedy(
         pad_token_id: padding token id
         max_new_tokens: max tokens to generate
         bad_token_ids: tokens never generated (e.g. <unk>, as per Donut inference)
+        repeat_stop: stop samples that fall into a repetition loop (untrimmed, see trim_repeat_loop())
 
     Returns:
         Generated token ids per sample (excluding prompt), including the stop token if generated.
@@ -66,11 +128,19 @@ def generate_greedy(
     next_ids = _select(logits)
     stop_ids = torch.tensor(list(stop_token_ids), device=device)
     finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    loops = repeat_stop is not None and repeat_stop.enabled and max_new_tokens > 0
+    if loops:
+        tokens = torch.full((batch_size, max_new_tokens), pad_token_id, dtype=torch.long, device=device)
     generated = []
-    for _ in range(max_new_tokens):
+    for i in range(max_new_tokens):
         next_ids = torch.where(finished, torch.full_like(next_ids, pad_token_id), next_ids)
         generated.append(next_ids)
         finished |= torch.isin(next_ids, stop_ids)
+        if loops:
+            tokens[:, i] = next_ids
+            if (i + 1) % repeat_stop.check_every == 0:
+                # rows that finished earlier only repeat pad, already finished
+                finished |= _loop_period(tokens, i + 1, repeat_stop) > 0
         if finished.all():
             break
         logits, state = model.step(next_ids[:, None], state)

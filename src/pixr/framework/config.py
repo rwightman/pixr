@@ -25,6 +25,9 @@ class TaskCfg:
     # patch level text loss: image patch features -> token at that patch (or blank) through the shared LM head,
     # for batches w/ 'patch_label_index' / 'patch_label' (data dependent, e.g. the read task), models w/ patch_index
     patch_loss_weight: float = 0.
+    # teacher forcing input token noise: probability per text token of a random (in-batch) substitute in the decoder
+    # input, targets stay clean (exposure bias / repetition loop remedy, as Nougat's anti-repetition augmentation)
+    text_input_noise: float = 0.
 
 
 @dataclass

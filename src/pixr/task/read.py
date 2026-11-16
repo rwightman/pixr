@@ -9,6 +9,7 @@ import chugr
 from chugr.doc import PatchLabelCfg, SynthTextCfg
 
 from pixr.framework import DeviceEnv, TaskCfg
+from pixr.generation import RepeatStopCfg, trim_repeat_loop
 from pixr.utils import text_error_rates
 from .common import ImageTextTask, image_feature_info
 
@@ -25,6 +26,8 @@ class ReadTaskCfg(TaskCfg):
     eval_max_new_tokens: int = 1023
     eval_num_beams: int = 1  # beam search for eval generation, 1 == greedy
     eval_page_sampling: str = 'first'
+    # eval decode time repetition loop stop + trim (min_repeats > 0 enables), e.g. --task.eval-repeat-stop.min-repeats 8
+    eval_repeat_stop: RepeatStopCfg = field(default_factory=RepeatStopCfg)
     # synthetic text rendering (of the sample's own annotation text, target == rendered text, no bboxes used)
     synth_prob: float = 0.  # train, probability of a synthetic rendering replacing the page
     eval_synth_prob: float = 0.  # eval, 1.0 for held-out synthetic reading CER
@@ -98,8 +101,9 @@ class ReadTask(ImageTextTask):
             image_input, self._prompts(n), [self.tokenizer.eos_token_id], self.cfg.metrics_max_new_tokens)
         predictions = self.tokenizer.batch_decode(generated, skip_special_tokens=True)
         targets = []
-        for t in batch['text_input'][:n]:
-            t = t[t != self.pad_token_id][1:]  # drop start token
+        # references from the targets (prompt / pad masked), the inputs may be noised (text_input_noise)
+        for t in batch['text_target'][:n]:
+            t = t[t != -100]
             # NOTE not truncated to the generated length, an early EOS must count against the prediction
             targets.append(self.tokenizer.decode(t[:self.cfg.metrics_max_new_tokens], skip_special_tokens=True))
         rates = text_error_rates(predictions, targets)
@@ -123,12 +127,19 @@ class ReadTask(ImageTextTask):
 
     def evaluate(self, loader, use_ema: bool = False) -> Dict[str, Any]:
         predictions, references = [], []
-        num_truncated = 0
+        num_truncated = num_loops = 0
+        repeat_stop = self.cfg.eval_repeat_stop
+        stop_ids = [self.tokenizer.eos_token_id]
         for batch in loader:
             texts = batch['text_input']
             generated = self.generate(
-                batch['image_input'], self._prompts(len(texts)), [self.tokenizer.eos_token_id],
-                self.cfg.eval_max_new_tokens, use_ema=use_ema, num_beams=self.cfg.eval_num_beams)
+                batch['image_input'], self._prompts(len(texts)), stop_ids,
+                self.cfg.eval_max_new_tokens, use_ema=use_ema, num_beams=self.cfg.eval_num_beams,
+                repeat_stop=repeat_stop)
+            if repeat_stop.enabled:
+                trimmed = [trim_repeat_loop(g, repeat_stop, stop_ids) for g in generated]
+                generated = [g for g, _ in trimmed]
+                num_loops += sum(t for _, t in trimmed)
             predictions.extend(self.tokenizer.batch_decode(generated, skip_special_tokens=True))
             for t in texts:
                 ref, truncated = self._prepare_reference(t[0] if isinstance(t, (list, tuple)) else t)
@@ -138,10 +149,13 @@ class ReadTask(ImageTextTask):
             predictions = [p for r in self.device_env.all_gather_object(predictions) for p in r]
             references = [p for r in self.device_env.all_gather_object(references) for p in r]
             num_truncated = sum(self.device_env.all_gather_object(num_truncated))
+            num_loops = sum(self.device_env.all_gather_object(num_loops))
         self.results = [{'prediction': p, 'reference': r} for p, r in zip(predictions, references)]
         metrics = text_error_rates(predictions, references)
         metrics['num_samples'] = len(predictions)
         metrics['truncated_refs'] = num_truncated / max(len(references), 1)  # fraction of capped references
+        if repeat_stop.enabled:
+            metrics['repeat_stopped'] = num_loops / max(len(predictions), 1)  # fraction of loop stopped / trimmed
         return metrics
 
     def save_results(self, output_dir: str, name: str = 'read'):

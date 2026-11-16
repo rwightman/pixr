@@ -10,7 +10,7 @@ from chugr.doc import DEFAULT_DOC_KEY
 from pixr.data import create_image_preprocessor, ImagePreprocessorFactory
 from pixr.framework import DeviceEnv, TaskCfg, TrainingTask
 from pixr.framework.task import move_to_device
-from pixr.generation import generate_beam, generate_greedy
+from pixr.generation import RepeatStopCfg, generate_beam, generate_greedy
 from pixr.loss import fused_linear_cross_entropy, lm_cross_entropy
 from pixr.models import ModelArgs, ModelCfg, Cruller, create_model, load_model_state
 from pixr.tokenizers import TokenizerCfg, create_tokenizer, get_added_tokens
@@ -98,6 +98,29 @@ def trim_padding(text_input: torch.Tensor, text_target: torch.Tensor, pad_token_
         max_len = -(-max_len // multiple) * multiple
     max_len = min(max(max_len, 1), text_input.shape[1])
     return text_input[:, :max_len], text_target[:, :max_len]
+
+
+def noise_text_input(
+        text_input: torch.Tensor,
+        text_target: torch.Tensor,
+        prob: float,
+        ignore_id: int = -100,
+        generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    """ Teacher forcing input token noise (exposure bias / repetition loop remedy), targets stay clean.
+
+    Each text token of the input (positions w/ a target, i.e. not prompt or pad) is replaced w/ probability `prob`
+    by a token drawn from the batch's own text tokens, the model learns to continue correctly after a wrong token
+    instead of locking into it. As Nougat's anti-repetition augmentation (random token replacement) but per token
+    and w/o corrupting the targets (Nougat's code trains on the perturbed sequence as labels too). In-batch draws
+    give plausible substitutes (and never unused / special ids of large vocabs, e.g. tiktoken).
+    """
+    content = text_target != ignore_id
+    if prob <= 0 or not bool(content.any()):
+        return text_input
+    src = torch.multinomial(content.flatten().float(), text_input.numel(), replacement=True, generator=generator)
+    replace = (torch.rand(text_input.shape, generator=generator, device=text_input.device) < prob) & content
+    return torch.where(replace, text_input.flatten()[src].view_as(text_input), text_input)
 
 
 class ImageTextTask(TrainingTask):
@@ -198,12 +221,21 @@ class ImageTextTask(TrainingTask):
             # text is padded to max_length per sample by the data pipeline, trim to the batch
             batch['text_input'], batch['text_target'] = trim_padding(
                 text_input, text_target, self.pad_token_id, multiple=self.cfg.text_pad_multiple)
+            if self.cfg.text_input_noise > 0:
+                # NOTE prepare_batch is train only, train_metrics() references come from text_target
+                batch['text_input'] = noise_text_input(
+                    batch['text_input'], batch['text_target'], self.cfg.text_input_noise)
         return super().prepare_batch(batch)
 
     @torch.no_grad()
     def generate(self, image_input, prompts: Sequence[Sequence[int]], stop_token_ids, max_new_tokens: int,
-                 use_ema: bool = False, num_beams: int = 1, length_penalty: float = 1.0):
-        """ Greedy (num_beams == 1) or beam search decode. Under FSDP call within `full_params(use_ema)`. """
+                 use_ema: bool = False, num_beams: int = 1, length_penalty: float = 1.0,
+                 repeat_stop: Optional[RepeatStopCfg] = None):
+        """ Greedy (num_beams == 1) or beam search decode. Under FSDP call within `full_params(use_ema)`.
+
+        `repeat_stop` early stops greedy samples in a repetition loop (beam search ignores it), outputs are not
+        trimmed here, see pixr.generation.trim_repeat_loop().
+        """
         model = self.get_trainable_module(use_ema)
         if not self.has_full_params(model):
             # W/ sharded params every prefill / step would all-gather, ranks decode different numbers of steps
@@ -226,7 +258,7 @@ class ImageTextTask(TrainingTask):
             if num_beams > 1:
                 out = generate_beam(model, image_input, num_beams=num_beams, length_penalty=length_penalty, **kwargs)
             else:
-                out = generate_greedy(model, image_input, **kwargs)
+                out = generate_greedy(model, image_input, repeat_stop=repeat_stop, **kwargs)
         if was_training:
             model.train()
         return out
