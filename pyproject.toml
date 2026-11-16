@@ -36,6 +36,7 @@ dependencies = [
     "numpy",
     "chugr>=0.2.0.dev0",  # chugr 0.2 (revive) loaders, NaFlex batching
     "Levenshtein",
+    "rapidfuzz",  # (Levenshtein dependency) batched distances for the order robust read metrics
     "pyyaml",
     "jsonargparse",
     "tiktoken",

@@ -10,7 +10,7 @@ from chugr.doc import PatchLabelCfg, SynthTextCfg
 
 from pixr.framework import DeviceEnv, TaskCfg
 from pixr.generation import RepeatStopCfg, trim_repeat_loop
-from pixr.utils import text_error_rates
+from pixr.utils import line_matched_error_rates, text_error_rates
 from .common import ImageTextTask, image_feature_info
 
 _logger = logging.getLogger(__name__)
@@ -28,6 +28,9 @@ class ReadTaskCfg(TaskCfg):
     eval_page_sampling: str = 'first'
     # eval decode time repetition loop stop + trim (min_repeats > 0 enables), e.g. --task.eval-repeat-stop.min-repeats 8
     eval_repeat_stop: RepeatStopCfg = field(default_factory=RepeatStopCfg)
+    # eval reading order robust metrics next to CER / WER: lm_cer (line matched CER), lm_cer_gap (CER - lm_cer, reading
+    # order share of CER), order_tau (mean page line order Kendall tau), order_pages (pages w/ a tau), ~s per 1k pages
+    eval_order_metrics: bool = True
     # synthetic text rendering (of the sample's own annotation text, target == rendered text, no bboxes used)
     synth_prob: float = 0.  # train, probability of a synthetic rendering replacing the page
     eval_synth_prob: float = 0.  # eval, 1.0 for held-out synthetic reading CER
@@ -152,6 +155,8 @@ class ReadTask(ImageTextTask):
             num_loops = sum(self.device_env.all_gather_object(num_loops))
         self.results = [{'prediction': p, 'reference': r} for p, r in zip(predictions, references)]
         metrics = text_error_rates(predictions, references)
+        if self.cfg.eval_order_metrics:
+            metrics.update(line_matched_error_rates(predictions, references))
         metrics['num_samples'] = len(predictions)
         metrics['truncated_refs'] = num_truncated / max(len(references), 1)  # fraction of capped references
         if repeat_stop.enabled:

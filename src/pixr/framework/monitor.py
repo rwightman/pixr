@@ -46,11 +46,27 @@ class SummaryCsv:
         self.needs_header = not os.path.exists(self.filename)
 
     def update(self, row_dict):
-        with open(self.filename, mode='a') as cf:
+        if not self.needs_header:
+            with open(self.filename, newline='') as cf:
+                reader = csv.DictReader(cf)
+                fieldnames, rows = list(reader.fieldnames or []), list(reader)
+            new_keys = [k for k in row_dict if k not in fieldnames]
+            if new_keys:
+                # new columns (e.g. metrics added on a resume w/ newer code), rewrite w/ the union of the columns
+                fieldnames += new_keys
+                with open(self.filename, mode='w', newline='') as cf:
+                    dw = csv.DictWriter(cf, fieldnames=fieldnames)
+                    dw.writeheader()
+                    dw.writerows(rows)
+                    dw.writerow(row_dict)
+                return
+            with open(self.filename, mode='a', newline='') as cf:
+                csv.DictWriter(cf, fieldnames=fieldnames).writerow(row_dict)
+            return
+        with open(self.filename, mode='a', newline='') as cf:
             dw = csv.DictWriter(cf, fieldnames=row_dict.keys())
-            if self.needs_header:  # first iteration (epoch == 1 can't be used)
-                dw.writeheader()
-                self.needs_header = False
+            dw.writeheader()  # first iteration (epoch == 1 can't be used)
+            self.needs_header = False
             dw.writerow(row_dict)
 
 
