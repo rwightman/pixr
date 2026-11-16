@@ -199,6 +199,14 @@ materialize full logits), padding is dropped before the head GEMM and each chunk
 so the [tokens, vocab] logits (~150k vocab for Qwen3) are never materialized. `--task.z-loss-weight` (e.g. `1e-4`) adds
 a z-loss (mean squared logsumexp), `--task.label-smoothing` is supported by both paths.
 
+### Image augmentation
+
+Train pages get light document augmentation (binarize, erode / dilate, shear, shift / rotate, elastic, brightness /
+contrast, blur), each op applied independently w/ a small probability. Options are `--task.image-aug.*` (chugr
+`DocAugCfg`), e.g. `--task.image-aug.bitmap-prob 0.1`, a probability of 0 disables an op, `--task.image-aug.prob-scale`
+scales all of them (0 == no augmentation). `--task.image-aug.random-seq-len-prob` trains NaFlex models on a random
+fraction of the patch budget (`--task.image-aug.random-seq-len-range`) for that share of pages.
+
 ### NaFlex batching
 
 For NaFlex models the train loader can draw a sequence length per batch and size the batch to a token budget, w/

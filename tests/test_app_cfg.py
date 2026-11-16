@@ -42,3 +42,22 @@ def test_default_and_eval_cfg():
     assert cfg.task_name == 'read' and isinstance(cfg.task, ReadTaskCfg)
     ecfg = parse_cfg(EvalCfg, argv=['--checkpoint-path', 'c.pt'], task_cfgs=get_task_cfgs(), default_task='docvqa')
     assert isinstance(ecfg.task, DocVqaTaskCfg) and ecfg.checkpoint_path == 'c.pt'
+
+
+def test_image_aug_cfg(tmp_path):
+    from chugr import DocAugCfg
+    from pixr.data import ImagePreprocessorFactory
+    cfg = _train([
+        '--task.image-aug.bitmap-prob', '0.2', '--task.image-aug.shear-range-x', '[0, 5]',
+        '--task.image-aug.prob_scale=0.5',
+    ])
+    aug = cfg.task.image_aug
+    assert isinstance(aug, DocAugCfg) and aug.bitmap_prob == 0.2 and aug.shear_range_x == (0., 5.)
+    assert aug.prob('bitmap_prob') == 0.1 and aug.elastic_prob == DocAugCfg().elastic_prob
+    p = tmp_path / 'cfg.yaml'
+    cfg.save(p)
+    assert _train(['--config', str(p)]).task.image_aug == aug
+
+    info = dict(naflex=True, image_size=None, image_fmt='L', mean=(0.5,), std=(0.5,), patch_size=16, max_seq_len=1024)
+    t = ImagePreprocessorFactory(info, True, aug_cfg=DocAugCfg(prob_scale=0.))(512)
+    assert not [op for op in t.transforms if type(op).__name__ == 'RandomApply']

@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
+from chugr.common import DocAugCfg
+
 from pixr.models import ModelArgs
 from pixr.tokenizers import TokenizerCfg
 
@@ -11,6 +13,7 @@ class TaskCfg:
     model: ModelArgs = field(default_factory=ModelArgs)
     tokenizer: Optional[TokenizerCfg] = None  # default == text decoder name (or checkpoint tokenizer)
     image_transforms: Optional[str] = None  # chugr transform type, default 'doc_naflex' or 'doc_better'
+    image_aug: DocAugCfg = field(default_factory=DocAugCfg)  # train augmentation of the doc transforms
     dtype: Optional[str] = 'bfloat16'  # low precision dtype for autocast ('bfloat16' or 'float16')
     amp: bool = True
     label_smoothing: float = 0.

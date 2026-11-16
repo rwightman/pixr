@@ -121,10 +121,11 @@ class ImageTextTask(TrainingTask):
         self.pad_token_id = tokenizer.pad_token_id
         self.input_info = model.image_encoder.input_info
         self.image_preprocess_train = create_image_preprocessor(
-            self.input_info, is_training=True, transform_type=cfg.image_transforms)
+            self.input_info, is_training=True, transform_type=cfg.image_transforms, aug_cfg=cfg.image_aug)
         self.image_preprocess_eval = create_image_preprocessor(
             self.input_info, is_training=False, transform_type=cfg.image_transforms)
-        self.image_preprocess_factory = ImagePreprocessorFactory(self.input_info, True, cfg.image_transforms)
+        self.image_preprocess_factory = ImagePreprocessorFactory(
+            self.input_info, True, cfg.image_transforms, aug_cfg=cfg.image_aug)
 
     def extra_state(self) -> Dict[str, Any]:
         return checkpoint_extra_state(self.get_trainable_module(), self.tokenizer, self.task_name)
