@@ -116,6 +116,12 @@ class CronutCfg(Serializable):
     patch_pre_norm: bool = True  # norm on projected patch embeddings (stream scale equalization)
     text_pre_norm: bool = True  # norm on projected text embeddings
     attn_backend: str = 'sdpa'  # 'sdpa' (dense prefix-LM mask) or 'flex' (prefix-LM block mask)
+    # in-fusion vision capacity (Unbundling Multimodal Vision Encoding, arXiv 2611.17334): the first `vision_layers`
+    # blocks get image token only (zero init) deltas on the attention projections (image tokens use W + ΔW) and / or
+    # an image token only SwiGLU branch added to the shared FFN. Text tokens only ever use the shared weights.
+    vision_layers: int = 0  # 0 disables
+    vision_attn_delta: bool = True  # q (incl. the attention gate) / k / v / out projection deltas
+    vision_ffn_size: int = 0  # image token only SwiGLU branch width, 0 disables
 
 
 @dataclass

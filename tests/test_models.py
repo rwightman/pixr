@@ -327,6 +327,98 @@ def test_cronut_checkpoint_vocab_expansion(tmp_path):
     assert torch.equal(model2.lm_head.weight[:100], model.lm_head.weight)
 
 
+def _tiny_cronut_vision_cfg(vision_layers=1, vision_ffn_size=32, attn_backend='sdpa'):
+    cfg = _tiny_cronut_cfg(attn_backend)
+    return replace(cfg, cronut=replace(cfg.cronut, vision_layers=vision_layers, vision_ffn_size=vision_ffn_size))
+
+
+def _randomize_vision_params(model, std=0.05):
+    """ in-fusion params start at zero (function preserving), make them non-trivial for equivalence tests """
+    with torch.no_grad():
+        for n, p in model.named_parameters():
+            if any(k in n for k in model.init_missing_param_patterns):
+                p.normal_(std=std)
+
+
+def test_cronut_vision_zero_init_upcycle(tmp_path):
+    """ An in-fusion model loaded from a checkpoint w/o the vision params (upcycling) matches the base model. """
+    torch.manual_seed(0)
+    base = create_model(_tiny_cronut_cfg(), vocab_size=100, pad_token_id=1).eval()
+    path = tmp_path / 'cronut.pt'
+    torch.save({'model': base.state_dict()}, path)
+    model = create_model(_tiny_cronut_vision_cfg(), vocab_size=100, pad_token_id=1, pretrained=str(path)).eval()
+    names = [n for n, _ in model.named_parameters() if any(k in n for k in model.init_missing_param_patterns)]
+    assert len(names) == 4 + 3  # q / k / v / out deltas + vision SwiGLU (no bias) in 1 layer
+    assert all(n.startswith('layers.0.') for n in names)
+    patches = _patches()
+    text = torch.randint(3, 100, (2, 9))
+    with torch.no_grad():
+        torch.testing.assert_close(model(patches, text), base(patches, text), atol=0, rtol=0)
+    # a strict load still fails for other missing params
+    sd = base.state_dict()
+    sd.pop('ln_post.weight')
+    with pytest.raises(RuntimeError):
+        load_model_state(model, sd)
+
+
+@pytest.mark.parametrize('attn_backend', ['sdpa', 'flex'])
+def test_cronut_vision_mask_matches_slice(attn_backend):
+    """ The per token image mask path (planned pack_prefix layout) matches the block layout prefix slice. """
+    if attn_backend == 'flex' and _DEV == 'cpu':
+        pytest.skip('flex needs cuda')
+    torch.manual_seed(0)
+    model = create_model(
+        _tiny_cronut_vision_cfg(vision_layers=2, attn_backend=attn_backend), vocab_size=100, pad_token_id=1)
+    model = model.to(_DEV).eval()
+    _randomize_vision_params(model)
+    patches = {k: v.to(_DEV) for k, v in _patches().items()}
+    text = torch.randint(3, 100, (2, 9), device=_DEV)
+    memory = model.encode_image(patches)
+    P = memory.embeds.shape[1]
+    txt = model.embed_text(text)
+    x = torch.cat([memory.embeds, txt], dim=1)
+    pos = torch.cat([memory.pos, (memory.text_start[:, None] + torch.arange(9, device=_DEV))[None].expand(3, -1, -1)], 2)
+    rope = model.rotary(pos)
+    key_valid = torch.cat([memory.mask, torch.ones_like(text, dtype=torch.bool)], dim=1)
+    attn_mask = model._attn_mask(key_valid, P, x)
+    mask = (torch.arange(x.shape[1], device=_DEV) < P)[None].expand(2, -1)
+    with torch.no_grad():
+        a = model._run(x, rope, attn_mask, image_tokens=P)
+        b = model._run(x, rope, attn_mask, image_tokens=mask)
+        c = model._run(x, rope, attn_mask, image_tokens=0)
+    torch.testing.assert_close(a, b, atol=1e-5, rtol=1e-5)
+    assert (a - c).abs().max() > 1e-3  # the vision params are in use
+
+
+def test_cronut_vision_generation_matches_forward():
+    """ Cached generation w/ in-fusion (image K / V from W + ΔW at prefill, text steps shared weights only). """
+    torch.manual_seed(0)
+    model = create_model(_tiny_cronut_vision_cfg(vision_layers=2), vocab_size=100, pad_token_id=1).eval()
+    _randomize_vision_params(model)
+    patches = _patches()
+    prompts = [[5], [6, 7, 8]]
+    out = generate_greedy(model, patches, prompt_ids=prompts, stop_token_ids=[2], pad_token_id=1, max_new_tokens=12)
+    for i, prompt in enumerate(prompts):
+        single = {k: v[i:i + 1] for k, v in patches.items()}
+        seq = torch.tensor([prompt + out[i]])
+        with torch.no_grad():
+            logits = model(single, seq[:, :-1])
+        assert logits[0, len(prompt) - 1:].argmax(-1).tolist() == out[i]
+
+
+def test_cronut_vision_grads():
+    """ Image tokens train the shared weights and the deltas, the deltas get no gradient w/o image tokens. """
+    torch.manual_seed(0)
+    model = create_model(_tiny_cronut_vision_cfg(), vocab_size=100, pad_token_id=1)
+    patches = _patches()
+    text = torch.randint(3, 100, (2, 9))
+    model(patches, text).float().pow(2).mean().backward()
+    attn = model.layers[0].attn
+    for d in (attn.q_delta, attn.k_delta, attn.v_delta, attn.out_delta):
+        assert d.grad is not None and d.grad.abs().sum() > 0
+    assert model.layers[0].vision_mlp.fc2.weight.grad.abs().sum() > 0
+
+
 @pytest.mark.parametrize('dec_type', ['ettin', 'qwen3'])
 def test_prefix_lm_flex_matches_sdpa(dec_type):
     from pixr.models import EttinTextDecoder, Qwen3TextDecoder
@@ -424,11 +516,12 @@ def test_mrope_uses_spatial_positions(interleaved):
     from pixr.models.cronut import MRoPE
     rope = MRoPE(64, (16, 8, 8) if not interleaved else (11, 11, 10), 1e4, interleaved=interleaved)
     pos = torch.stack([torch.zeros(1, 6, dtype=torch.long), torch.arange(6)[None], torch.arange(6)[None] * 2])
-    cos = rope(pos)[0]
+    emb = rope(pos)  # [B, 1, S, 2 * head_dim], cat([sin, cos])
+    cos = emb.chunk(2, dim=-1)[1]
     for axis in (1, 2):
         moved = pos.clone()
         moved[axis] += 3
-        assert not torch.equal(rope(moved)[0], cos), f'axis {axis} positions have no effect'
+        assert not torch.equal(rope(moved), emb), f'axis {axis} positions have no effect'
     if not interleaved:
         # contiguous T / H / W frequency sections (Qwen2-VL)
         freqs = pos[..., None].float() * rope.inv_freq

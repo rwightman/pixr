@@ -10,8 +10,29 @@ text. Follows the open_clip NaFlex GenLIP modelling:
 * gated attention (sigmoid output gate fused into q_proj), optional qk-norm, SwiGLU FFN, LayerScale, DropPath
 * untied LM head, text embedding dim decoupled from trunk width via in / out projections
 
+* optional in-fusion vision capacity (arXiv 2611.17334): image token only attention projection deltas and an image
+  token only SwiGLU branch in the first `vision_layers` blocks (zero init, text tokens use the shared weights only)
+
 Attention backends: 'sdpa' (dense prefix-LM bool mask) or 'flex' (FlexAttention prefix-LM block mask).
 Same training forward and encode_image() / prefill() / step() generation interface as Cruller and Fritter.
+
+Sequence layout and image token routing:
+
+* Current (block) layout: every row is [P image slots ; text], P the batch's padded patch count (invalid patches
+  masked by patch_valid), so the image tokens are always positions [0, P) and `image_tokens` is that int. Image only
+  computation (in-fusion) is a slice, one matmul per modality (W + ΔW for the image slice, no extra FLOPs).
+* Planned `pack_prefix` mode (as open_clip NaFlexGenLip pack_prefix): rows compacted to [valid image (P_i) ;
+  text ; PAD] w/ per row prefix lengths [B], removing the padding between image and text, and allowing text only
+  rows (P_i = 0) to fill their row w/ text instead of image padding. Image tokens are then a [B, S] bool mask,
+  already accepted as `image_tokens` by the in-fusion helpers (masked dense: both projections over all tokens,
+  route by gather / scatter if the extra FLOPs matter). Still needed: a per row prefix length flex mask_mod
+  (prefix_len[b] lookup), per row text placement for the MRoPE ids (text_start already per row), and gathered
+  text outputs / full row targets for the loss (the fused CE drops ignored positions before the head GEMM). Row
+  assembly should be a gather w/ indices from [B] lengths (no boolean index writes / host syncs in the forward).
+* Further (unpadded / varlen) direction: one flat stream over the batch, sorted by modality as [all image ; all text]
+  w/ per token document ids for the flex mask_mod (attention semantics come from the doc ids, flags and explicit
+  position ids, not the physical order), which turns the image tokens back into a single slice. NOTE torch varlen
+  (Flash) kernels can't express prefix-LM within a segment, so this stays on flex.
 """
 import logging
 from dataclasses import replace
@@ -74,8 +95,8 @@ class MRoPE(nn.Module):
         self.register_buffer('inv_freq', inv_freq, persistent=False)
 
     @torch.no_grad()
-    def forward(self, position_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """ position_ids [3, B, S] -> float32 cos / sin [B, 1, S, head_dim] """
+    def forward(self, position_ids: torch.Tensor) -> torch.Tensor:
+        """ position_ids [3, B, S] -> float32 rope [B, 1, S, 2 * head_dim], cat([sin, cos]) (timm 'cat' layout) """
         freqs = position_ids[..., None].float() * self.inv_freq.float()  # 3, B, S, head_dim // 2
         if self.interleaved:
             f = freqs[0].clone()
@@ -86,7 +107,7 @@ class MRoPE(nn.Module):
         else:
             freqs = torch.cat([f[axis] for axis, f in enumerate(freqs.split(self.mrope_section, dim=-1))], dim=-1)
         emb = torch.cat((freqs, freqs), dim=-1)
-        return emb.cos()[:, None], emb.sin()[:, None]
+        return torch.cat([emb.sin(), emb.cos()], dim=-1)[:, None]
 
 
 def _patch_valid(image_input: Dict[str, Any]) -> torch.Tensor:
@@ -98,15 +119,51 @@ def _patch_valid(image_input: Dict[str, Any]) -> torch.Tensor:
     return valid.bool()
 
 
-def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+def apply_rope(x: torch.Tensor, rope: torch.Tensor) -> torch.Tensor:
+    """ Rotate half RoPE w/ a cat([sin, cos]) embedding (same as timm apply_rot_embed_cat(x, rope, half=True)). """
     # rotate in float32 (bf16 activations under autocast / FSDP mixed precision)
     dtype = x.dtype
     x = x.float()
+    sin, cos = rope.chunk(2, dim=-1)
     return (x * cos + rotate_half(x) * sin).to(dtype)
 
 
+# Image token selection for image only (in-fusion) computation: an int n (block layout, the first n positions of
+# every row) or a [B, S] bool mask (per row layouts, e.g. the planned pack_prefix mode or text only rows).
+ImageTokens = Union[int, torch.Tensor, None]
+
+
+def _has_image_tokens(image_tokens: ImageTokens) -> bool:
+    # NOTE a mask is assumed to (possibly) select tokens, no data dependent check (host sync)
+    return image_tokens is not None and (not isinstance(image_tokens, int) or image_tokens > 0)
+
+
+def image_linear(x: torch.Tensor, lin: nn.Linear, delta: Optional[torch.Tensor], image_tokens: ImageTokens):
+    """ lin(x), w/ the image tokens projected by (W + ΔW). """
+    if delta is None or not _has_image_tokens(image_tokens):
+        return lin(x)
+    weight = lin.weight + delta
+    if isinstance(image_tokens, int):
+        # block layout: image tokens are a prefix slice, one matmul per modality
+        img = F.linear(x[:, :image_tokens], weight, lin.bias)
+        return torch.cat([img, lin(x[:, image_tokens:])], dim=1)
+    # per token mask: masked dense (both projections over all tokens)
+    # FIXME route (gather image / text tokens, scatter back) if the extra FLOPs matter
+    return torch.where(image_tokens[..., None], F.linear(x, weight, lin.bias), lin(x))
+
+
+def image_residual(y: torch.Tensor, x: torch.Tensor, fn: Optional[nn.Module], image_tokens: ImageTokens):
+    """ y + fn(x) for the image tokens, y for the rest. """
+    if fn is None or not _has_image_tokens(image_tokens):
+        return y
+    if isinstance(image_tokens, int):
+        return torch.cat([y[:, :image_tokens] + fn(x[:, :image_tokens]), y[:, image_tokens:]], dim=1)
+    # FIXME route image tokens only if the extra FLOPs matter
+    return y + fn(x) * image_tokens[..., None].to(y.dtype)
+
+
 class CronutAttention(nn.Module):
-    def __init__(self, cfg: CronutCfg, norm_layer):
+    def __init__(self, cfg: CronutCfg, norm_layer, vision_delta: bool = False):
         super().__init__()
         self.width = cfg.width
         self.num_heads = cfg.num_heads
@@ -119,18 +176,29 @@ class CronutAttention(nn.Module):
         self.out_proj = nn.Linear(cfg.width, cfg.width, bias=bias)
         self.q_norm = norm_layer(self.head_dim) if cfg.qk_norm else nn.Identity()
         self.k_norm = norm_layer(self.head_dim) if cfg.qk_norm else nn.Identity()
-
-    def forward(self, x, cos, sin, attn_mask=None, is_causal=False, cache=None):
-        B, S, _ = x.shape
-        if self.gated:
-            q, gate = self.q_proj(x).chunk(2, dim=-1)
+        if vision_delta:
+            # in-fusion: image token only weight deltas (zero init, image tokens start w/ the shared weights), the
+            # image tokens are projected by (W + ΔW), so no extra matmul. The q delta covers the gate half (gated)
+            self.q_delta = nn.Parameter(torch.zeros_like(self.q_proj.weight))
+            self.k_delta = nn.Parameter(torch.zeros_like(self.k_proj.weight))
+            self.v_delta = nn.Parameter(torch.zeros_like(self.v_proj.weight))
+            self.out_delta = nn.Parameter(torch.zeros_like(self.out_proj.weight))
         else:
-            q, gate = self.q_proj(x), None
+            self.q_delta = self.k_delta = self.v_delta = self.out_delta = None
+
+    def forward(self, x, rope, attn_mask=None, is_causal=False, cache=None, image_tokens: ImageTokens = None):
+        B, S, _ = x.shape
+        q = image_linear(x, self.q_proj, self.q_delta, image_tokens)
+        if self.gated:
+            q, gate = q.chunk(2, dim=-1)
+        else:
+            gate = None
         q = q.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        k = image_linear(x, self.k_proj, self.k_delta, image_tokens).view(B, S, self.num_heads, self.head_dim)
+        v = image_linear(x, self.v_proj, self.v_delta, image_tokens).view(B, S, self.num_heads, self.head_dim)
+        k, v = k.transpose(1, 2), v.transpose(1, 2)
         q, k = self.q_norm(q), self.k_norm(k)
-        q, k = apply_rope(q, cos, sin).to(v.dtype), apply_rope(k, cos, sin).to(v.dtype)
+        q, k = apply_rope(q, rope).to(v.dtype), apply_rope(k, rope).to(v.dtype)
         if cache is not None:
             if cache.k is not None:
                 k = torch.cat([cache.k, k], dim=2)
@@ -139,17 +207,19 @@ class CronutAttention(nn.Module):
         out = self_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal).transpose(1, 2)  # B, S, H, D
         if gate is not None:
             out = out * torch.sigmoid(gate.view(B, S, self.num_heads, self.head_dim))
-        return self.out_proj(out.reshape(B, S, self.width))
+        # output positions line up w/ x (the cache only extends K / V), same image token selection
+        return image_linear(out.reshape(B, S, self.width), self.out_proj, self.out_delta, image_tokens)
 
 
 class CronutMlp(nn.Module):
-    def __init__(self, cfg: CronutCfg):
+    def __init__(self, cfg: CronutCfg, intermediate_size: Optional[int] = None):
         super().__init__()
+        hidden = intermediate_size or cfg.intermediate_size
         self.act = _ACT[cfg.hidden_act]
         self.swiglu = cfg.use_swiglu_ffn
-        self.fc1 = nn.Linear(cfg.width, cfg.intermediate_size, bias=cfg.mlp_bias)
-        self.gate_fc = nn.Linear(cfg.width, cfg.intermediate_size, bias=cfg.mlp_bias) if self.swiglu else None
-        self.fc2 = nn.Linear(cfg.intermediate_size, cfg.width, bias=cfg.mlp_bias)
+        self.fc1 = nn.Linear(cfg.width, hidden, bias=cfg.mlp_bias)
+        self.gate_fc = nn.Linear(cfg.width, hidden, bias=cfg.mlp_bias) if self.swiglu else None
+        self.fc2 = nn.Linear(hidden, cfg.width, bias=cfg.mlp_bias)
 
     def forward(self, x):
         if self.swiglu:
@@ -167,20 +237,23 @@ class LayerScale(nn.Module):
 
 
 class CronutBlock(nn.Module):
-    def __init__(self, cfg: CronutCfg, norm_layer, drop_path: float = 0.):
+    def __init__(self, cfg: CronutCfg, norm_layer, drop_path: float = 0., vision: bool = False):
         super().__init__()
         self.norm1 = norm_layer(cfg.width)
-        self.attn = CronutAttention(cfg, norm_layer)
+        self.attn = CronutAttention(cfg, norm_layer, vision_delta=vision and cfg.vision_attn_delta)
         self.norm2 = norm_layer(cfg.width)
         self.mlp = CronutMlp(cfg)
+        # in-fusion: image token only SwiGLU branch on the same norm2 output, added to the shared FFN output
+        self.vision_mlp = CronutMlp(cfg, cfg.vision_ffn_size) if vision and cfg.vision_ffn_size else None
         use_ls = cfg.ls_init_value is not None and cfg.ls_init_value > 0
         self.ls1 = LayerScale(cfg.width, cfg.ls_init_value) if use_ls else nn.Identity()
         self.ls2 = LayerScale(cfg.width, cfg.ls_init_value) if use_ls else nn.Identity()
         self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
 
-    def forward(self, x, cos, sin, attn_mask=None, is_causal=False, cache=None):
-        x = x + self.drop_path(self.ls1(self.attn(self.norm1(x), cos, sin, attn_mask, is_causal, cache)))
-        x = x + self.drop_path(self.ls2(self.mlp(self.norm2(x))))
+    def forward(self, x, rope, attn_mask=None, is_causal=False, cache=None, image_tokens: ImageTokens = None):
+        x = x + self.drop_path(self.ls1(self.attn(self.norm1(x), rope, attn_mask, is_causal, cache, image_tokens)))
+        h = self.norm2(x)
+        x = x + self.drop_path(self.ls2(image_residual(self.mlp(h), h, self.vision_mlp, image_tokens)))
         return x
 
 
@@ -215,6 +288,8 @@ class CronutPatchEmbed(nn.Module):
 class Cronut(nn.Module):
     # vocab sized params, rows expanded when loading checkpoints into a model w/ added tokens
     vocab_param_names = ('text_embed.weight', 'lm_head.weight')
+    # zero init (function preserving) in-fusion params, may be missing when loading a checkpoint w/o them (upcycling)
+    init_missing_param_patterns = ('.q_delta', '.k_delta', '.v_delta', '.out_delta', '.vision_mlp.')
 
     def __init__(self, cfg: ModelCfg, vocab_size: int, pad_token_id: int = 0):
         super().__init__()
@@ -232,7 +307,9 @@ class Cronut(nn.Module):
         self.text_norm_pre = norm_layer(c.width) if c.text_pre_norm else nn.Identity()
         self.rotary = MRoPE(c.width // c.num_heads, c.mrope_section, c.rope_theta, c.mrope_interleaved)
         dpr = [x.item() for x in torch.linspace(0, c.drop_path_rate, c.depth)]
-        self.layers = nn.ModuleList([CronutBlock(c, norm_layer, drop_path=dpr[i]) for i in range(c.depth)])
+        assert c.vision_layers <= c.depth, f'vision_layers ({c.vision_layers}) > depth ({c.depth})'
+        self.layers = nn.ModuleList([
+            CronutBlock(c, norm_layer, drop_path=dpr[i], vision=i < c.vision_layers) for i in range(c.depth)])
         self.ln_post = norm_layer(c.width)
         self.out_proj = nn.Linear(c.width, c.text_embed_dim) if c.text_embed_dim != c.width else nn.Identity()
         self.lm_head = nn.Linear(c.text_embed_dim, vocab_size, bias=False)
@@ -259,6 +336,10 @@ class Cronut(nn.Module):
                 for lin in (m.fc1, m.gate_fc, m.fc2):
                     if lin is not None:
                         nn.init.xavier_uniform_(lin.weight)
+        for blk in self.layers:
+            if blk.vision_mlp is not None:
+                # in-fusion branch output starts at zero (the attention deltas are zero init Parameters)
+                nn.init.zeros_(blk.vision_mlp.fc2.weight)
 
     @property
     def max_text_length(self) -> int:
@@ -300,13 +381,13 @@ class Cronut(nn.Module):
         mask = mask | torch.eye(S, dtype=torch.bool, device=x.device)[None]
         return mask[:, None]
 
-    def _run(self, x, cos, sin, attn_mask, cache=None):
+    def _run(self, x, rope, attn_mask, cache=None, image_tokens: ImageTokens = None):
         for i, blk in enumerate(self.layers):
             layer_cache = cache[i] if cache is not None else None
             if self.grad_checkpointing and self.training and layer_cache is None:
-                x = checkpoint(blk, x, cos, sin, attn_mask, False, None, use_reentrant=False)
+                x = checkpoint(blk, x, rope, attn_mask, False, None, image_tokens, use_reentrant=False)
             else:
-                x = blk(x, cos, sin, attn_mask, False, layer_cache)
+                x = blk(x, rope, attn_mask, False, layer_cache, image_tokens)
         return self.ln_post(x)
 
     def _logits(self, x):
@@ -350,9 +431,10 @@ class Cronut(nn.Module):
         P = img.shape[1]
         txt_pos = text_start[:, None] + (text_mask.long().cumsum(1) - 1).clamp(min=0)  # B, T
         pos = torch.cat([img_pos, txt_pos[None].expand(3, -1, -1)], dim=2)
-        cos, sin = self.rotary(pos)
+        rope = self.rotary(pos)
         key_valid = torch.cat([patch_valid, text_mask.bool()], dim=1)
-        x = self._run(x, cos, sin, self._attn_mask(key_valid, P, x), cache=cache)
+        # block layout, the image tokens are the first P positions of every row
+        x = self._run(x, rope, self._attn_mask(key_valid, P, x), cache=cache, image_tokens=P)
         patch_x = None
         if patch_index is not None:
             patch_x = self.out_proj(x[:, :P].gather(1, patch_index[..., None].expand(-1, -1, x.shape[-1])))
@@ -398,7 +480,7 @@ class Cronut(nn.Module):
         state.attn_mask = torch.cat([state.attn_mask, state.attn_mask.new_ones(token_ids.shape)], dim=1)
         x = self.embed_text(token_ids)
         pos = state.pos[None, :, None].expand(3, -1, 1)
-        cos, sin = self.rotary(pos)
+        rope = self.rotary(pos)
         attn_mask = state.attn_mask[:, None, None, :]
-        x = self._run(x, cos, sin, attn_mask, cache=state.cache)
+        x = self._run(x, rope, attn_mask, cache=state.cache)  # text tokens only, shared weights
         return self._logits(x)[:, -1], state

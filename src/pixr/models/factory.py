@@ -74,6 +74,12 @@ def load_model_state(model: torch.nn.Module, state_dict, strict: bool = True):
             state_dict[key] = resize_pos_embed(src, own[key].shape[0])
             _logger.info(f'Resized {key} {src.shape[0]} -> {own[key].shape[0]}.')
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    # params w/ a function preserving init (e.g. Cronut in-fusion deltas) may be absent, they keep their init
+    init_ok = getattr(model, 'init_missing_param_patterns', ())
+    kept_init = [k for k in missing if any(p in k for p in init_ok)]
+    if kept_init:
+        _logger.info(f'{len(kept_init)} params not in the checkpoint keep their (function preserving) init.')
+        missing = [k for k in missing if k not in kept_init]
     if strict and (missing or unexpected):
         raise RuntimeError(f'Error loading model state. Missing: {missing}, unexpected: {unexpected}')
     return missing, unexpected
